@@ -1,0 +1,637 @@
+"""A single self-contained HTML report.
+
+Everything is inlined into one file: no CDN, no network, no companion assets.
+You can open it from disk, move it, or send it to yourself and it still works.
+
+The treemap is the point of this report. A table tells you the ten biggest
+folders; a treemap shows you the shape of the whole drive at once, and which
+one branch is quietly holding a third of it.
+"""
+
+from __future__ import annotations
+
+import datetime as _datetime
+import json
+
+from . import categories
+from .insights import Report, build_tree
+from .scanner import ScanResult
+
+TREE_MIN_SIZE = 8 * 1024 * 1024
+
+
+def _volume_payload(result: ScanResult) -> list:
+    return [
+        {"root": root, "total": total, "used": used, "free": free}
+        for root, (total, used, free) in result.volumes.items()
+    ]
+
+
+def build_payload(report: Report) -> dict:
+    result = report.result
+    total = result.total_size or 1
+
+    return {
+        "generated": _datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "scan": {
+            "files": result.total_files,
+            "dirs": result.total_dirs,
+            "size": result.total_size,
+            "logical": result.logical_size,
+            "elapsed": result.elapsed,
+            "roots": [node.display for node in result.root_nodes],
+            "skipped": len(result.skipped),
+            "errors": len(result.errors),
+            "links": len(result.reparse_points),
+            "allocated": result.config.use_allocated,
+            "includeOs": result.config.include_os,
+        },
+        "volumes": _volume_payload(result),
+        "tree": build_tree(result, TREE_MIN_SIZE),
+        "reclaim": report.reclaimable,
+        "categories": [
+            {
+                "key": category.key,
+                "label": category.label,
+                "confidence": category.confidence,
+                "hint": category.hint,
+                "count": count,
+                "size": size,
+                "share": share,
+            }
+            for category, count, size, share in report.category_rows
+        ],
+        "folders": [
+            {
+                "path": node.display,
+                "size": node.total_size,
+                "files": node.total_files,
+                "cat": node.category or "other",
+            }
+            for node in report.top_folders
+        ],
+        "hotspots": [
+            {
+                "path": node.display,
+                "size": node.own_size,
+                "files": node.own_files,
+                "cat": node.category or "other",
+            }
+            for node in report.hotspots
+        ],
+        "files": [
+            {"path": path, "size": size, "mtime": mtime}
+            for size, path, mtime in report.top_files
+        ],
+        "oldFiles": [
+            {"path": path, "size": size, "mtime": mtime}
+            for size, path, mtime in report.old_files
+        ],
+        "extensions": [
+            {"ext": ext, "count": count, "size": size, "share": share}
+            for ext, count, size, share in report.extension_rows[:40]
+        ],
+        "ages": [
+            {"label": label, "count": count, "size": size, "share": size / total}
+            for label, count, size in report.age_rows
+        ],
+        "duplicates": [
+            {"size": group.size, "wasted": group.wasted, "paths": group.paths}
+            for group in report.duplicates[:150]
+        ],
+        "duplicatesTruncated": report.duplicates_truncated,
+        "osManaged": [
+            {"path": path, "size": size}
+            for path, size in sorted(result.os_managed, key=lambda item: -item[1])
+        ],
+        "skippedPaths": [
+            {"path": path, "reason": reason} for path, reason in result.skipped[:200]
+        ],
+        "categoryMeta": {
+            category.key: {
+                "label": category.label,
+                "confidence": category.confidence,
+                "hint": category.hint,
+            }
+            for category in categories.CATEGORIES
+        },
+    }
+
+
+def write_html(report: Report, path: str) -> str:
+    payload = build_payload(report)
+    # </script> inside the JSON would end the block early; escaping the slash
+    # keeps the document valid without changing what JSON.parse sees.
+    blob = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    document = TEMPLATE.replace("__PAYLOAD__", blob)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(document)
+    return path
+
+
+TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Disk Analyzer report</title>
+<style>
+:root{
+  --bg:#f6f7f9; --panel:#ffffff; --ink:#14181f; --muted:#697386;
+  --line:#e3e7ed; --accent:#2f6fed; --safe:#1a7f4b; --review:#a86a00; --info:#697386;
+  --shadow:0 1px 2px rgba(16,24,40,.06),0 8px 24px rgba(16,24,40,.06);
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0e1116; --panel:#161b22; --ink:#e8edf4; --muted:#8b97a8;
+    --line:#242c37; --accent:#5b8cff; --safe:#4bd08b; --review:#e0a33e; --info:#8b97a8;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.25);
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.55 ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:32px 20px 72px}
+h1{font-size:24px;margin:0 0 4px;letter-spacing:-.02em}
+h2{font-size:15px;margin:0 0 14px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.sub{color:var(--muted);margin:0 0 26px}
+.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;
+  background:color-mix(in srgb,var(--safe) 16%,transparent);color:var(--safe);font-weight:600}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:20px;margin-bottom:22px;box-shadow:var(--shadow)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin-bottom:22px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;box-shadow:var(--shadow)}
+.card .k{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.card .v{font-size:23px;font-weight:650;letter-spacing:-.02em;margin-top:5px}
+.card .n{font-size:12px;color:var(--muted);margin-top:3px}
+.gauge{height:10px;border-radius:999px;background:var(--line);overflow:hidden;margin-top:12px}
+.gauge>i{display:block;height:100%;background:var(--accent)}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+  cursor:pointer;user-select:none;white-space:nowrap}
+th:hover{color:var(--ink)}
+td.num{text-align:right;white-space:nowrap}
+td.path{font-family:ui-monospace,"Cascadia Code",Consolas,monospace;font-size:12.5px;word-break:break-all}
+tbody tr:hover{background:color-mix(in srgb,var(--accent) 7%,transparent)}
+.tag{display:inline-block;padding:1px 7px;border-radius:6px;font-size:11px;font-weight:600;white-space:nowrap}
+.tag.safe{background:color-mix(in srgb,var(--safe) 16%,transparent);color:var(--safe)}
+.tag.review{background:color-mix(in srgb,var(--review) 18%,transparent);color:var(--review)}
+.tag.info{background:color-mix(in srgb,var(--info) 16%,transparent);color:var(--info)}
+.bar{height:7px;border-radius:999px;background:var(--line);overflow:hidden;min-width:70px}
+.bar>i{display:block;height:100%;background:var(--accent)}
+input[type=search]{width:100%;padding:9px 12px;border-radius:9px;border:1px solid var(--line);
+  background:var(--bg);color:var(--ink);font:inherit;margin-bottom:12px}
+.crumbs{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:12px;font-size:13px}
+.crumbs button{background:none;border:0;color:var(--accent);cursor:pointer;font:inherit;padding:2px 4px;border-radius:6px}
+.crumbs button:hover{background:color-mix(in srgb,var(--accent) 12%,transparent)}
+.crumbs span{color:var(--muted)}
+#map{position:relative;height:520px;border-radius:11px;overflow:hidden;background:var(--line)}
+.cell{position:absolute;overflow:hidden;border-radius:4px;cursor:pointer;
+  padding:5px 7px;color:#fff;transition:filter .12s;border:1px solid rgba(0,0,0,.18)}
+.cell:hover{filter:brightness(1.16)}
+.cell .nm{font-size:12px;font-weight:600;text-shadow:0 1px 2px rgba(0,0,0,.55);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cell .sz{font-size:11px;opacity:.92;text-shadow:0 1px 2px rgba(0,0,0,.55)}
+.cell.leaf{cursor:default}
+.legend{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px;font-size:12px;color:var(--muted)}
+.legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.note{color:var(--muted);font-size:12.5px;margin-top:10px}
+.dupgroup{border:1px solid var(--line);border-radius:10px;padding:11px 13px;margin-bottom:9px}
+.dupgroup .hd{font-weight:650;margin-bottom:5px}
+.dupgroup ul{margin:0;padding-left:17px;font-family:ui-monospace,Consolas,monospace;font-size:12px;
+  word-break:break-all;color:var(--muted)}
+.foot{color:var(--muted);font-size:12.5px;text-align:center;margin-top:34px}
+.empty{color:var(--muted);font-style:italic}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Disk Analyzer</h1>
+  <p class="sub">
+    <span class="badge">read-only</span>
+    &nbsp;Nothing was deleted, moved or modified. Generated <span id="gen"></span>.
+  </p>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="panel">
+    <h2>Treemap</h2>
+    <div class="crumbs" id="crumbs"></div>
+    <div id="map"></div>
+    <div class="legend" id="legend"></div>
+    <p class="note">Every rectangle is sized by the space it uses. Click a folder to
+      go deeper, and use the trail above to come back. Folders under 8 MB are folded
+      into their parent.</p>
+  </div>
+
+  <div class="panel">
+    <h2>What is taking the space</h2>
+    <div id="cats"></div>
+    <p class="note" id="reclaim"></p>
+  </div>
+
+  <div class="panel">
+    <h2>Largest folders</h2>
+    <p class="note" style="margin-top:0">Each row is the deepest folder that still
+      accounts for its whole total, so a single big tree appears once instead of at
+      every level above it.</p>
+    <input type="search" id="q-folders" placeholder="Filter folders...">
+    <div id="folders"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Largest files</h2>
+    <input type="search" id="q-files" placeholder="Filter files...">
+    <div id="files"></div>
+  </div>
+
+  <div class="panel" id="old-panel">
+    <h2>Big and untouched</h2>
+    <p class="note" style="margin-top:0">Large files you have not modified in over a
+      year. Usually the easiest thing to look at first.</p>
+    <div id="oldfiles"></div>
+  </div>
+
+  <div class="panel" id="dup-panel">
+    <h2>Likely duplicates</h2>
+    <p class="note" style="margin-top:0">Same exact size, same first and last 64 KB.
+      Strong evidence, not proof: check before you act on any of these.</p>
+    <div id="dups"></div>
+  </div>
+
+  <div class="panel">
+    <h2>By file type</h2>
+    <div id="exts"></div>
+  </div>
+
+  <div class="panel">
+    <h2>By age</h2>
+    <div id="ages"></div>
+  </div>
+
+  <div class="panel" id="notes-panel">
+    <h2>Scan notes</h2>
+    <div id="notes"></div>
+  </div>
+
+  <p class="foot">DiskAnalyzer &mdash; inventory only. It has no ability to delete anything.</p>
+</div>
+
+<script id="payload" type="application/json">__PAYLOAD__</script>
+<script>
+const DATA = JSON.parse(document.getElementById("payload").textContent);
+
+const PALETTE = {
+  "dev-deps":"#8b5cf6","dev-build":"#6366f1","dev-cache":"#0ea5e9","temp":"#14b8a6",
+  "app-cache":"#06b6d4","browser":"#f59e0b","recycle-bin":"#84cc16","windows-old":"#ef4444",
+  "installer-cache":"#f97316","downloads":"#eab308","vm-disk":"#ec4899","disc-image":"#d946ef",
+  "logs":"#22c55e","backup":"#a855f7","cloud-sync":"#3b82f6","games":"#f43f5e",
+  "media":"#0891b2","apps":"#64748b","other":"#94a3b8"
+};
+const colorOf = k => PALETTE[k] || PALETTE.other;
+
+function fmtSize(n){
+  if(n === null || n === undefined) return "";
+  const u = ["B","KB","MB","GB","TB","PB"];
+  let v = n, i = 0;
+  while(Math.abs(v) >= 1024 && i < u.length-1){ v /= 1024; i++; }
+  return i === 0 ? v + " B" : v.toFixed(1) + " " + u[i];
+}
+const fmtNum = n => n.toLocaleString();
+function fmtAge(ts){
+  if(!ts) return "";
+  const d = Math.max(0, Math.floor((Date.now()/1000 - ts)/86400));
+  if(d < 1) return "today";
+  if(d < 60) return d + "d";
+  if(d < 730) return Math.floor(d/30) + "mo";
+  return Math.floor(d/365) + "y";
+}
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+const el = (tag, html) => { const n = document.createElement(tag); if(html!==undefined) n.innerHTML = html; return n; };
+
+document.getElementById("gen").textContent = DATA.generated;
+
+/* ---------------------------------------------------------------- cards */
+(function cards(){
+  const host = document.getElementById("cards");
+  const s = DATA.scan;
+  const vol = DATA.volumes[0];
+  if(vol){
+    const pct = vol.total ? vol.used/vol.total : 0;
+    host.appendChild(el("div",
+      '<div class="k">' + esc(vol.root) + ' free space</div>' +
+      '<div class="v">' + fmtSize(vol.free) + '</div>' +
+      '<div class="n">' + fmtSize(vol.used) + ' used of ' + fmtSize(vol.total) + '</div>' +
+      '<div class="gauge"><i style="width:' + (pct*100).toFixed(1) + '%"></i></div>')).className = "card";
+  }
+  host.appendChild(el("div",
+    '<div class="k">Scanned</div><div class="v">' + fmtSize(s.size) + '</div>' +
+    '<div class="n">' + fmtNum(s.files) + ' files in ' + fmtNum(s.dirs) + ' folders</div>')).className = "card";
+  host.appendChild(el("div",
+    '<div class="k">Regenerable</div><div class="v" style="color:var(--safe)">' +
+    fmtSize(DATA.reclaim.safe || 0) + '</div>' +
+    '<div class="n">caches and build output that rebuild themselves</div>')).className = "card";
+  host.appendChild(el("div",
+    '<div class="k">Worth review</div><div class="v" style="color:var(--review)">' +
+    fmtSize(DATA.reclaim.review || 0) + '</div>' +
+    '<div class="n">often unwanted, but only you can say</div>')).className = "card";
+})();
+
+/* -------------------------------------------------------------- treemap */
+const mapHost = document.getElementById("map");
+const crumbHost = document.getElementById("crumbs");
+let trail = DATA.tree ? [DATA.tree] : [];
+
+function childrenOf(node){
+  const kids = (node.children || []).slice();
+  if(node.rest > 0){
+    kids.push({ name:"(files in this folder)", path:node.path, size:node.rest,
+                files:0, cat:node.cat, leaf:true });
+  }
+  return kids.filter(k => k.size > 0).sort((a,b) => b.size - a.size);
+}
+
+function worst(row, area, side){
+  let mx = 0, mn = Infinity;
+  for(const r of row){ if(r.area > mx) mx = r.area; if(r.area < mn) mn = r.area; }
+  const s2 = area * area, w2 = side * side;
+  return Math.max(w2 * mx / s2, s2 / (w2 * mn));
+}
+
+/* Squarified treemap: lay items out in rows chosen to keep rectangles as close
+   to square as possible, because long thin slivers are unreadable and their
+   relative areas impossible to compare by eye. */
+function squarify(items, x, y, w, h){
+  const out = [];
+  const total = items.reduce((s,d) => s + d.size, 0);
+  if(total <= 0 || w <= 0 || h <= 0) return out;
+  const scale = (w * h) / total;
+  const nodes = items.map(d => ({ d, area: d.size * scale }));
+  let i = 0;
+  while(i < nodes.length){
+    const side = Math.min(w, h);
+    if(side <= 0) break;
+    let row = [nodes[i]], rowArea = nodes[i].area, j = i + 1;
+    while(j < nodes.length){
+      const next = row.concat([nodes[j]]);
+      if(worst(row, rowArea, side) <= worst(next, rowArea + nodes[j].area, side)) break;
+      row = next; rowArea += nodes[j].area; j++;
+    }
+    const thick = rowArea / side;
+    let off = 0;
+    for(const r of row){
+      const len = r.area / thick;
+      if(w >= h) out.push({ d:r.d, x, y:y+off, w:thick, h:len });
+      else       out.push({ d:r.d, x:x+off, y, w:len, h:thick });
+      off += len;
+    }
+    if(w >= h){ x += thick; w -= thick; } else { y += thick; h -= thick; }
+    i = j;
+  }
+  return out;
+}
+
+function drawMap(){
+  const node = trail[trail.length - 1];
+  mapHost.innerHTML = "";
+  crumbHost.innerHTML = "";
+
+  if(!node){
+    mapHost.innerHTML = '<p class="empty" style="padding:16px">Nothing large enough to draw.</p>';
+    return;
+  }
+
+  trail.forEach((n, idx) => {
+    if(idx) crumbHost.appendChild(el("span", "&rsaquo;"));
+    const b = el("button", esc(idx === 0 ? (n.path || n.name) : n.name));
+    b.onclick = () => { trail = trail.slice(0, idx + 1); drawMap(); };
+    crumbHost.appendChild(b);
+  });
+  crumbHost.appendChild(el("span", "&mdash; " + fmtSize(node.size) +
+    ", " + fmtNum(node.files) + " files"));
+
+  const kids = childrenOf(node);
+  if(!kids.length){
+    mapHost.innerHTML = '<p class="empty" style="padding:16px">No subfolders large enough to show.</p>';
+    return;
+  }
+
+  const W = mapHost.clientWidth, H = mapHost.clientHeight;
+  for(const r of squarify(kids, 0, 0, W, H)){
+    const isLeaf = r.d.leaf || !(r.d.children && r.d.children.length);
+    const cell = el("div");
+    cell.className = "cell" + (isLeaf ? " leaf" : "");
+    cell.style.cssText = "left:" + r.x + "px;top:" + r.y + "px;width:" + Math.max(0, r.w - 2) +
+      "px;height:" + Math.max(0, r.h - 2) + "px;background:" + colorOf(r.d.cat);
+    cell.title = (r.d.path || r.d.name) + "\n" + fmtSize(r.d.size) +
+      (r.d.files ? "\n" + fmtNum(r.d.files) + " files" : "");
+    if(r.w > 54 && r.h > 26){
+      cell.appendChild(el("div", esc(r.d.name))).className = "nm";
+      if(r.h > 42) cell.appendChild(el("div", fmtSize(r.d.size))).className = "sz";
+    }
+    if(!isLeaf) cell.onclick = () => { trail.push(r.d); drawMap(); };
+    mapHost.appendChild(cell);
+  }
+}
+
+(function legend(){
+  const host = document.getElementById("legend");
+  const seen = new Set(DATA.categories.map(c => c.key));
+  for(const key of seen){
+    const meta = DATA.categoryMeta[key];
+    if(!meta) continue;
+    host.appendChild(el("span",
+      '<i style="background:' + colorOf(key) + '"></i>' + esc(meta.label)));
+  }
+})();
+
+drawMap();
+let resizeTimer;
+addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(drawMap, 150); });
+
+/* --------------------------------------------------------------- tables */
+function renderTable(host, columns, rows){
+  const target = typeof host === "string" ? document.getElementById(host) : host;
+  target.innerHTML = "";
+  if(!rows.length){
+    target.appendChild(el("p", "Nothing to show.")).className = "empty";
+    return;
+  }
+  const table = el("table");
+  const head = el("thead");
+  const hr = el("tr");
+  columns.forEach((col, idx) => {
+    const th = el("th", col.label);
+    th.onclick = () => sortBy(idx);
+    hr.appendChild(th);
+  });
+  head.appendChild(hr);
+  table.appendChild(head);
+  const body = el("tbody");
+  table.appendChild(body);
+  target.appendChild(table);
+
+  let sortIdx = -1, desc = true;
+  function paint(){
+    body.innerHTML = "";
+    let view = rows.slice();
+    if(sortIdx >= 0){
+      const key = columns[sortIdx].sort;
+      view.sort((a,b) => {
+        const x = key(a), y = key(b);
+        return (x < y ? -1 : x > y ? 1 : 0) * (desc ? -1 : 1);
+      });
+    }
+    for(const row of view){
+      const tr = el("tr");
+      for(const col of columns){
+        const td = el("td", col.cell(row));
+        if(col.cls) td.className = col.cls;
+        tr.appendChild(td);
+      }
+      body.appendChild(tr);
+    }
+  }
+  function sortBy(idx){
+    if(!columns[idx].sort) return;
+    if(sortIdx === idx) desc = !desc; else { sortIdx = idx; desc = true; }
+    paint();
+  }
+  paint();
+  return { paint };
+}
+
+function tagFor(key){
+  const meta = DATA.categoryMeta[key];
+  if(!meta) return "";
+  return '<span class="tag ' + meta.confidence + '">' + esc(meta.label) + '</span>';
+}
+
+function filterable(inputId, host, columns, rows, field){
+  const input = document.getElementById(inputId);
+  const draw = q => {
+    const needle = q.trim().toLowerCase();
+    renderTable(host, columns,
+      needle ? rows.filter(r => String(field(r)).toLowerCase().includes(needle)) : rows);
+  };
+  draw("");
+  input.addEventListener("input", () => draw(input.value));
+}
+
+/* categories */
+renderTable("cats", [
+  { label:"Size", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
+  { label:"Share", cls:"num", sort:r => r.share, cell:r => (r.share*100).toFixed(1) + "%" },
+  { label:"", cell:r => '<div class="bar"><i style="width:' + (r.share*100).toFixed(1) +
+      '%;background:' + colorOf(r.key) + '"></i></div>' },
+  { label:"Category", sort:r => r.label, cell:r => tagFor(r.key) },
+  { label:"Files", cls:"num", sort:r => r.count, cell:r => fmtNum(r.count) },
+  { label:"What it means", cell:r => esc(r.hint) },
+], DATA.categories);
+
+document.getElementById("reclaim").innerHTML =
+  "<b>" + fmtSize(DATA.reclaim.safe || 0) + "</b> sits in regenerable caches and build output. " +
+  "<b>" + fmtSize(DATA.reclaim.review || 0) + "</b> more is in categories worth reviewing" +
+  (DATA.reclaim.duplicates ? ", and <b>" + fmtSize(DATA.reclaim.duplicates) +
+    "</b> is held by duplicate copies" : "") +
+  ". DiskAnalyzer only reports these; removing anything is your decision, made elsewhere.";
+
+/* folders */
+filterable("q-folders", "folders", [
+  { label:"Size", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
+  { label:"Files", cls:"num", sort:r => r.files, cell:r => fmtNum(r.files) },
+  { label:"Category", sort:r => r.cat, cell:r => tagFor(r.cat) },
+  { label:"Folder", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
+], DATA.folders, r => r.path);
+
+/* files */
+filterable("q-files", "files", [
+  { label:"Size", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
+  { label:"Modified", cls:"num", sort:r => r.mtime, cell:r => fmtAge(r.mtime) },
+  { label:"File", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
+], DATA.files, r => r.path);
+
+/* old files */
+if(DATA.oldFiles.length){
+  renderTable("oldfiles", [
+    { label:"Size", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
+    { label:"Age", cls:"num", sort:r => r.mtime, cell:r => fmtAge(r.mtime) },
+    { label:"File", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
+  ], DATA.oldFiles);
+} else {
+  document.getElementById("old-panel").remove();
+}
+
+/* duplicates */
+(function dups(){
+  const host = document.getElementById("dups");
+  if(!DATA.duplicates.length){ document.getElementById("dup-panel").remove(); return; }
+  for(const g of DATA.duplicates){
+    const box = el("div");
+    box.className = "dupgroup";
+    box.appendChild(el("div", fmtSize(g.size) + " &times; " + g.paths.length +
+      ' &mdash; <span style="color:var(--accent)">' + fmtSize(g.wasted) +
+      " recoverable</span>")).className = "hd";
+    const list = el("ul");
+    for(const p of g.paths) list.appendChild(el("li", esc(p)));
+    box.appendChild(list);
+    host.appendChild(box);
+  }
+  if(DATA.duplicatesTruncated){
+    host.appendChild(el("p", "The duplicate search stopped at its read budget; more may exist.")).className = "note";
+  }
+})();
+
+/* extensions */
+renderTable("exts", [
+  { label:"Size", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
+  { label:"Share", cls:"num", sort:r => r.share, cell:r => (r.share*100).toFixed(1) + "%" },
+  { label:"", cell:r => '<div class="bar"><i style="width:' + (r.share*100).toFixed(1) + '%"></i></div>' },
+  { label:"Extension", sort:r => r.ext, cell:r => esc(r.ext) },
+  { label:"Files", cls:"num", sort:r => r.count, cell:r => fmtNum(r.count) },
+], DATA.extensions);
+
+/* ages */
+renderTable("ages", [
+  { label:"Size", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
+  { label:"Share", cls:"num", sort:r => r.share, cell:r => (r.share*100).toFixed(1) + "%" },
+  { label:"", cell:r => '<div class="bar"><i style="width:' + (r.share*100).toFixed(1) + '%"></i></div>' },
+  { label:"Last modified", cell:r => esc(r.label) },
+  { label:"Files", cls:"num", sort:r => r.count, cell:r => fmtNum(r.count) },
+], DATA.ages);
+
+/* notes */
+(function notes(){
+  const host = document.getElementById("notes");
+  const s = DATA.scan;
+  const bits = [];
+  bits.push("Roots scanned: <b>" + DATA.scan.roots.map(esc).join(", ") + "</b>.");
+  bits.push("Sizes are " + (s.allocated ? "rounded up to whole clusters (on-disk estimate)"
+    : "logical file sizes") + ".");
+  if(s.skipped) bits.push("<b>" + fmtNum(s.skipped) + "</b> paths skipped" +
+    (s.includeOs ? "" : ", including the live Windows installation") + ".");
+  if(s.links) bits.push("<b>" + fmtNum(s.links) +
+    "</b> junctions and symlinks were recorded but not followed, so nothing is counted twice.");
+  if(s.errors) bits.push("<b>" + fmtNum(s.errors) +
+    "</b> paths could not be read; run as Administrator to reach more of them.");
+  host.appendChild(el("p", bits.join(" "))).className = "note";
+
+  if(DATA.osManaged.length){
+    host.appendChild(el("h2", "OS-managed files"));
+    renderTable(host.appendChild(el("div")), [
+      { label:"Size", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
+      { label:"File", cls:"path", cell:r => esc(r.path) },
+    ], DATA.osManaged);
+    host.appendChild(el("p",
+      "Windows sizes these itself. Change them through System settings rather than by deleting them."
+    )).className = "note";
+  }
+})();
+</script>
+</body>
+</html>
+"""
