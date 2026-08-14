@@ -9,7 +9,7 @@ import re
 import sys
 import time
 
-from . import __version__, report_csv, report_html, report_terminal, safety
+from . import __version__, launch, report_csv, report_html, report_terminal, safety
 from .insights import build_report
 from .scanner import ScanConfig, scan
 from .util import human_count, human_size, supports_color
@@ -88,6 +88,15 @@ def build_parser() -> argparse.ArgumentParser:
     output.add_argument("--no-color", action="store_true", help="disable ANSI color")
     output.add_argument("--quiet", action="store_true", help="suppress progress output")
 
+    ui = parser.add_argument_group("interactive")
+    ui.add_argument("--ui", action="store_true",
+                    help="open the interactive sunburst UI in a browser instead "
+                         "of running a scan here")
+    ui.add_argument("--port", type=int, default=0, metavar="PORT",
+                    help="port for --ui (default: 8731, or any free port)")
+    ui.add_argument("--no-browser", action="store_true",
+                    help="with --ui, print the address instead of opening a browser")
+
     parser.add_argument("--verify-read-only", action="store_true",
                         help="audit this tool's own source for destructive calls and exit")
     return parser
@@ -128,6 +137,39 @@ def default_output_dir() -> str:
     return os.path.join(os.getcwd(), "reports", f"scan-{stamp}")
 
 
+def run_ui(port: int, open_in_browser: bool) -> int:
+    """Serve the interactive UI until interrupted."""
+    from . import server
+
+    try:
+        httpd = server.create(port)
+    except OSError as exc:
+        print(f"Could not start the interface: {exc}", file=sys.stderr)
+        return 1
+
+    url = server.url_for(httpd)
+    tint = supports_color(sys.stdout)
+    bold = "\033[1m" if tint else ""
+    reset = "\033[0m" if tint else ""
+    # Flushed explicitly: serve_forever() blocks straight after this, so with a
+    # redirected stdout the address would sit in a buffer until the server ends,
+    # which is exactly when it stops being useful.
+    print(f" DiskAnalyzer is at {bold}{url}{reset}")
+    print("   Reachable only from this machine, and only with the key in that address.")
+    print("   Press Ctrl+C here when you are done.\n", flush=True)
+
+    if open_in_browser:
+        launch.open_browser(url)
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nClosed. Nothing was modified.", file=sys.stderr)
+    finally:
+        httpd.server_close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -146,6 +188,10 @@ def main(argv: list[str] | None = None) -> int:
         for violation in violations:
             print("  " + violation.describe(), file=sys.stderr)
         return 1
+
+    # The UI picks its own targets, so the root checks below do not apply.
+    if args.ui:
+        return run_ui(args.port, open_in_browser=not args.no_browser)
 
     roots = tuple(args.roots) if args.roots else ("C:" + os.sep,)
     missing = [root for root in roots if not os.path.isdir(root)]

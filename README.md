@@ -9,10 +9,44 @@ deletes, moves, renames or modifies a file, and the tool verifies that about
 itself before every scan.
 
 ```
-python analyze.py
+python analyze.py --ui      point and click
+python analyze.py           straight to a report in the terminal
 ```
 
 Requires Python 3.10+. No dependencies, no installation.
+
+---
+
+## The interface
+
+`--ui` starts a small local server and opens a browser. Pick a drive, watch the
+count climb, and get a sunburst you can click your way into: each ring is one
+level down, the slice sizes are the folder sizes, and the middle takes you back
+up. Five levels of a drive are one picture instead of five screens.
+
+Colours mean something. By default every slice is tinted by what kind of thing
+it holds — regenerable cache, installer leftovers, virtual disks — using the
+same palette as the static report, so purple really is the same thing in both.
+Toggle to **by folder** for the plain one-hue-per-branch look when you only care
+about shape.
+
+Selecting anything gives you its full path, its share of the view, and a
+**Reveal in Explorer** button. That button is the end of the road: DiskAnalyzer
+hands the folder to Explorer and stops there. It does not delete, and it does
+not offer to.
+
+```
+python analyze.py --ui                     open the interface
+python analyze.py --ui --no-browser        just print the address
+python analyze.py --ui --port 9000         somewhere other than 8731
+```
+
+The server binds to 127.0.0.1, so nothing off this machine can reach it, and
+every request needs a key minted at startup and handed to the page in its
+opening URL — other software on the machine that guesses the port still gets
+turned away. It also refuses requests whose `Host` header is not the loopback
+address, which is what stops a web page you have open from talking to it. **Save
+report** writes the same `report.html` and `folders.csv` the CLI produces.
 
 ---
 
@@ -52,6 +86,11 @@ python analyze.py --verify-read-only
 The only files this project ever opens for writing are the reports, in the
 output directory you chose. Scanned files are opened read-only, and only when
 `--duplicates` needs to compare their contents.
+
+The interface does not change this. There is no delete button, because there is
+nothing behind it — the code to remove a file does not exist here and the audit
+would refuse to run if it did. **Reveal in Explorer** exists instead: it shows
+you the folder in a program that *can* delete, and leaves the decision with you.
 
 ---
 
@@ -201,15 +240,26 @@ and the differences above.
 analyze.py                  entry point
 diskanalyzer/
   safety.py                 the read-only audit
+  launch.py                 the only module allowed to start a program
   scanner.py                the single-pass walk
   exclusions.py             what is skipped, and why
-  categories.py             classification rules
+  categories.py             classification rules and the shared palette
   insights.py               rankings, duplicates, treemap pruning
+  browse.py                 child lookups for interactive drill-down
+  server.py                 the loopback API behind --ui
+  webapp.py                 the sunburst page
   report_terminal.py        the terminal report
   report_html.py            the self-contained HTML report
   report_csv.py             the CSV listings
   cli.py                    argument parsing and wiring
 ```
+
+The audit in `safety.py` also allowlists by module. Only the report writers may
+open a file for writing, and only `launch.py` may start another program —
+anything else that tries fails the audit and the run aborts. That second rule
+exists because a read-only tool can still do damage by handing a path to the
+shell, and a disk report is mostly paths to executables. `launch.py` starts
+Explorer, only with `/select`, and only for a path the scan actually visited.
 
 ### How it stays fast
 

@@ -124,6 +124,9 @@ def write_html(report: Report, path: str) -> str:
     # keeps the document valid without changing what JSON.parse sees.
     blob = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
     document = TEMPLATE.replace("__PAYLOAD__", blob)
+    # One palette for the whole tool: the same category is the same colour in
+    # the treemap here and in the live UI sunburst.
+    document = document.replace("__PALETTE__", json.dumps(categories.COLORS))
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(document)
     return path
@@ -282,13 +285,7 @@ input[type=search]{width:100%;padding:9px 12px;border-radius:9px;border:1px soli
 <script>
 const DATA = JSON.parse(document.getElementById("payload").textContent);
 
-const PALETTE = {
-  "dev-deps":"#8b5cf6","dev-build":"#6366f1","dev-cache":"#0ea5e9","temp":"#14b8a6",
-  "app-cache":"#06b6d4","browser":"#f59e0b","recycle-bin":"#84cc16","windows-old":"#ef4444",
-  "installer-cache":"#f97316","downloads":"#eab308","vm-disk":"#ec4899","disc-image":"#d946ef",
-  "logs":"#22c55e","backup":"#a855f7","cloud-sync":"#3b82f6","games":"#f43f5e",
-  "media":"#0891b2","apps":"#64748b","other":"#94a3b8"
-};
+const PALETTE = __PALETTE__;
 const colorOf = k => PALETTE[k] || PALETTE.other;
 
 function fmtSize(n){

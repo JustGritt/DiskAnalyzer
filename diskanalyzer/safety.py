@@ -20,6 +20,14 @@ from dataclasses import dataclass
 # user-specified output directory, never to a scanned path.
 WRITER_MODULES = frozenset({"report_html.py", "report_csv.py", "cli.py"})
 
+# Modules permitted to start another program. Launching is how a read-only tool
+# could still cause damage without ever calling a destructive API itself: hand a
+# path to the shell and the shell will run it. A disk report is full of .exe
+# files, so that would be one click away from every segment on the map. One
+# module owns every launch, which makes reviewing this capability a matter of
+# reading one file.
+LAUNCHER_MODULES = frozenset({"launch.py"})
+
 # Any occurrence of these outside an allowlisted context aborts the run.
 DESTRUCTIVE_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bos\.remove\b", "os.remove deletes a file"),
@@ -42,6 +50,14 @@ DESTRUCTIVE_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\.write_bytes\(", "write_bytes() writes to disk"),
     (r"\bRemove-Item\b", "Remove-Item deletes files"),
     (r"\bdel\s+/[fqs]", "del command deletes files"),
+    (r"\bos\.system\b", "os.system runs a shell command"),
+    (r"\bos\.startfile\b", "os.startfile executes the target"),
+    (r"shell\s*=\s*True", "shell=True lets a path become a command"),
+)
+
+# Starting a process at all. Permitted only in LAUNCHER_MODULES.
+SPAWN_PATTERN = re.compile(
+    r"\b(?:subprocess\.\w+|os\.spawn\w*|os\.popen|os\.exec\w*|webbrowser\.\w+)\s*\("
 )
 
 # open() calls in a write/append/update mode.
@@ -106,6 +122,16 @@ def audit_source(package_dir: str | None = None) -> list[Violation]:
                             "open() in write mode outside a report writer",
                         )
                     )
+
+            if module_name not in LAUNCHER_MODULES and SPAWN_PATTERN.search(code):
+                violations.append(
+                    Violation(
+                        module_name,
+                        line_no,
+                        line,
+                        "starts a process outside the single audited launcher",
+                    )
+                )
 
     return violations
 
