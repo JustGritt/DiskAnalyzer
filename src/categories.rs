@@ -1,0 +1,640 @@
+//! Classification of space into human-meaningful buckets.
+//!
+//! Every rule here answers one question: if this space matters to you, what
+//! would you do about it? Confidence levels:
+//!
+//! - `safe`: regenerable or already-discarded data. Cost of removal is time.
+//! - `review`: very often unwanted, but only you know. Look before acting.
+//! - `info`: not junk. Reported so the total adds up and you can see the shape.
+//!
+//! Path patterns are written with forward slashes and matched against a
+//! lowercased, slash-normalized copy of the path.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Confidence {
+    Safe,
+    Review,
+    Info,
+}
+
+impl Confidence {
+    pub fn key(self) -> &'static str {
+        match self {
+            Confidence::Safe => "safe",
+            Confidence::Review => "review",
+            Confidence::Info => "info",
+        }
+    }
+}
+
+/// One of the 19 categories. The discriminant doubles as an index into the
+/// per-category statistics arrays kept by the scanner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum CatId {
+    DevDeps,
+    DevBuild,
+    DevCache,
+    Temp,
+    AppCache,
+    Browser,
+    RecycleBin,
+    WindowsOld,
+    InstallerCache,
+    Downloads,
+    VmDisk,
+    DiscImage,
+    Logs,
+    Backup,
+    CloudSync,
+    Games,
+    Media,
+    Apps,
+    Other,
+}
+
+pub const NUM_CATEGORIES: usize = 19;
+
+pub const ALL: [CatId; NUM_CATEGORIES] = [
+    CatId::DevDeps,
+    CatId::DevBuild,
+    CatId::DevCache,
+    CatId::Temp,
+    CatId::AppCache,
+    CatId::Browser,
+    CatId::RecycleBin,
+    CatId::WindowsOld,
+    CatId::InstallerCache,
+    CatId::Downloads,
+    CatId::VmDisk,
+    CatId::DiscImage,
+    CatId::Logs,
+    CatId::Backup,
+    CatId::CloudSync,
+    CatId::Games,
+    CatId::Media,
+    CatId::Apps,
+    CatId::Other,
+];
+
+impl CatId {
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn from_index(index: usize) -> Option<CatId> {
+        ALL.get(index).copied()
+    }
+
+    pub fn from_key(key: &str) -> Option<CatId> {
+        ALL.iter().copied().find(|c| c.key() == key)
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            CatId::DevDeps => "dev-deps",
+            CatId::DevBuild => "dev-build",
+            CatId::DevCache => "dev-cache",
+            CatId::Temp => "temp",
+            CatId::AppCache => "app-cache",
+            CatId::Browser => "browser",
+            CatId::RecycleBin => "recycle-bin",
+            CatId::WindowsOld => "windows-old",
+            CatId::InstallerCache => "installer-cache",
+            CatId::Downloads => "downloads",
+            CatId::VmDisk => "vm-disk",
+            CatId::DiscImage => "disc-image",
+            CatId::Logs => "logs",
+            CatId::Backup => "backup",
+            CatId::CloudSync => "cloud-sync",
+            CatId::Games => "games",
+            CatId::Media => "media",
+            CatId::Apps => "apps",
+            CatId::Other => "other",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CatId::DevDeps => "Project dependencies",
+            CatId::DevBuild => "Build output",
+            CatId::DevCache => "Developer tool caches",
+            CatId::Temp => "Temp files",
+            CatId::AppCache => "Application caches",
+            CatId::Browser => "Browser profiles and caches",
+            CatId::RecycleBin => "Recycle Bin",
+            CatId::WindowsOld => "Windows upgrade leftovers",
+            CatId::InstallerCache => "Installer caches",
+            CatId::Downloads => "Downloads",
+            CatId::VmDisk => "Virtual machine and WSL disks",
+            CatId::DiscImage => "Disc images and archives",
+            CatId::Logs => "Logs and crash dumps",
+            CatId::Backup => "Backups and old copies",
+            CatId::CloudSync => "Cloud-synced folders",
+            CatId::Games => "Games and game stores",
+            CatId::Media => "Media files",
+            CatId::Apps => "Installed applications",
+            CatId::Other => "Everything else",
+        }
+    }
+
+    pub fn confidence(self) -> Confidence {
+        match self {
+            CatId::DevDeps
+            | CatId::DevBuild
+            | CatId::DevCache
+            | CatId::Temp
+            | CatId::AppCache
+            | CatId::RecycleBin
+            | CatId::Logs => Confidence::Safe,
+            CatId::Browser
+            | CatId::WindowsOld
+            | CatId::InstallerCache
+            | CatId::Downloads
+            | CatId::VmDisk
+            | CatId::DiscImage
+            | CatId::Backup => Confidence::Review,
+            CatId::CloudSync | CatId::Games | CatId::Media | CatId::Apps | CatId::Other => {
+                Confidence::Info
+            }
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            CatId::DevDeps => "node_modules / vendor trees, restorable with one install command",
+            CatId::DevBuild => "compiled artifacts, regenerated by the next build",
+            CatId::DevCache => "package-manager and compiler caches, refill on demand",
+            CatId::Temp => "temp folders nothing is waiting on",
+            CatId::AppCache => "app-managed caches, rebuilt automatically after clearing",
+            CatId::Browser => "profile data mixed with cache; clear from inside the browser",
+            CatId::RecycleBin => "already deleted, still occupying the volume",
+            CatId::WindowsOld => "previous Windows install; Disk Cleanup removes it, ends rollback",
+            CatId::InstallerCache => "MSI/setup payloads kept for repair and uninstall",
+            CatId::Downloads => "usually re-downloadable; check before clearing",
+            CatId::VmDisk => "virtual disks stay large after their contents shrink",
+            CatId::DiscImage => "ISOs and archives, often already extracted or installed",
+            CatId::Logs => "diagnostic output past its usefulness",
+            CatId::Backup => "bak/old copies and mail archives",
+            CatId::CloudSync => "OneDrive/Dropbox/Drive; free space via online-only files",
+            CatId::Games => "reinstallable from the store that owns them",
+            CatId::Media => "video, audio and creative assets",
+            CatId::Apps => "uninstall through Settings, not by deleting folders",
+            CatId::Other => "documents, source code and files no rule matched",
+        }
+    }
+}
+
+use CatId::*;
+
+// --------------------------------------------------------------------------
+// Directory rules. A directory that matches tags itself and everything beneath
+// it, so one match covers a whole tree without re-testing every child.
+// --------------------------------------------------------------------------
+
+/// Exact folder-name matches, checked first. Sorted by name for binary search.
+#[rustfmt::skip]
+const DIR_NAME_RULES: &[(&str, CatId)] = &[
+    (".android", DevCache),
+    (".angular", DevCache),
+    (".cache", AppCache),
+    (".cargo", DevCache),
+    (".ccache", DevCache),
+    (".conda", DevCache),
+    (".gradle", DevCache),
+    (".m2", DevCache),
+    (".mypy_cache", DevCache),
+    (".next", DevBuild),
+    (".nox", DevCache),
+    (".nuget", DevCache),
+    (".nuxt", DevBuild),
+    (".parcel-cache", DevCache),
+    (".pytest_cache", DevCache),
+    (".ruff_cache", DevCache),
+    (".rustup", DevCache),
+    (".stack", DevCache),
+    (".svelte-kit", DevCache),
+    (".terraform", DevCache),
+    (".tox", DevCache),
+    (".turbo", DevCache),
+    (".venv", DevDeps),
+    ("__pycache__", DevCache),
+    ("bower_components", DevDeps),
+    ("build", DevBuild),
+    ("cache", AppCache),
+    ("cache2", AppCache),
+    ("cache_data", AppCache),
+    ("cachedextensionvsixs", InstallerCache),
+    ("cachestorage", AppCache),
+    ("cmake-build-debug", DevBuild),
+    ("cmake-build-release", DevBuild),
+    ("cmakefiles", DevBuild),
+    ("code cache", AppCache),
+    ("crashdumps", Logs),
+    ("deriveddata", DevBuild),
+    ("dist", DevBuild),
+    ("dxcache", AppCache),
+    ("gpucache", AppCache),
+    ("node_modules", DevDeps),
+    ("obj", DevBuild),
+    ("ota-artifacts", InstallerCache),
+    ("shadercache", AppCache),
+    ("site-packages", DevDeps),
+    ("target", DevBuild),
+    ("temp", Temp),
+    ("thumbnails", AppCache),
+    ("tmp", Temp),
+    ("vendor", DevDeps),
+    ("venv", DevDeps),
+    ("virtualenv", DevDeps),
+];
+
+/// Checked on every directory even when one above it already matched, for
+/// the few places a broad ancestor rule would otherwise hide something more
+/// specific.
+#[rustfmt::skip]
+const OVERRIDE_PATH_RULES: &[(&str, CatId)] = &[
+    ("/.pixi/envs", DevDeps),
+    ("/nvidia/ngx", AppCache),
+    ("/updateframework/ota-artifacts", InstallerCache),
+];
+
+#[derive(Debug, Clone, Copy)]
+pub enum Match {
+    /// Needle appears anywhere in the path.
+    Sub,
+    /// Path starts with the needle (anchored rules for Unix system dirs).
+    Prefix,
+}
+
+/// Ordered path rules; first match wins, so specific patterns come before
+/// general ones. The Windows table is kept intact for parity, with
+/// platform-specific additions inserted ahead of the broad tail rules.
+#[rustfmt::skip]
+const DIR_PATH_RULES_HEAD: &[(Match, &str, CatId)] = &[
+    // already-deleted content and upgrade leftovers
+    (Match::Sub, "/$recycle.bin", RecycleBin),
+    (Match::Sub, "/windows.old", WindowsOld),
+    (Match::Sub, "/$windows.~bt", WindowsOld),
+    (Match::Sub, "/$windows.~ws", WindowsOld),
+    // installer payloads
+    (Match::Sub, "/programdata/package cache", InstallerCache),
+    (Match::Sub, "/appdata/local/downloaded installations", InstallerCache),
+    (Match::Sub, "/appdata/local/packagecache", InstallerCache),
+    (Match::Sub, "/windows/installer", InstallerCache),
+    // developer caches
+    (Match::Sub, "/appdata/local/npm-cache", DevCache),
+    (Match::Sub, "/appdata/roaming/npm-cache", DevCache),
+    (Match::Sub, "/appdata/local/yarn/cache", DevCache),
+    (Match::Sub, "/appdata/local/pnpm", DevCache),
+    (Match::Sub, "/appdata/local/pip/cache", DevCache),
+    (Match::Sub, "/appdata/local/nuget", DevCache),
+    (Match::Sub, "/appdata/local/jetbrains", DevCache),
+    (Match::Sub, "/appdata/roaming/jetbrains", DevCache),
+    (Match::Sub, "/appdata/local/unity/cache", DevCache),
+    (Match::Sub, "/appdata/roaming/unity", DevCache),
+    (Match::Sub, "/.vscode/extensions", DevCache),
+    (Match::Sub, "/appdata/local/android/sdk", DevCache),
+    (Match::Sub, "/.android", DevCache),
+    (Match::Sub, "/.docker", VmDisk),
+    (Match::Sub, "/appdata/local/docker", VmDisk),
+    // game-engine project caches, matched one level deeper where the layout
+    // is unambiguous ("Library" alone is far too generic)
+    (Match::Sub, "/library/bee", DevBuild),
+    (Match::Sub, "/library/artifacts", DevBuild),
+    (Match::Sub, "/library/il2cppbuildcache", DevBuild),
+    (Match::Sub, "/library/playerdatacache", DevBuild),
+    (Match::Sub, "/library/scriptassemblies", DevBuild),
+    (Match::Sub, "/library/burst", DevBuild),
+    (Match::Sub, "/library/packagecache", DevDeps),
+    (Match::Sub, "/library/shadercache", DevCache),
+    (Match::Sub, "/library/statecache", DevCache),
+    (Match::Sub, "/library/artifactdb", DevCache),
+    (Match::Sub, "/derivedatacache", DevCache),
+    (Match::Sub, "/intermediate/build", DevBuild),
+    (Match::Sub, "/saved/autosaves", DevBuild),
+    (Match::Sub, "/.godot/imported", DevBuild),
+    (Match::Sub, "/.vs/", DevCache),
+    // temp and diagnostics
+    (Match::Sub, "/appdata/local/temp", Temp),
+    (Match::Sub, "/appdata/local/crashdumps", Logs),
+    (Match::Sub, "/appdata/local/microsoft/windows/inetcache", AppCache),
+    (Match::Sub, "/appdata/local/microsoft/windows/webcache", AppCache),
+    (Match::Sub, "/appdata/local/microsoft/windows/explorer", AppCache),
+    (Match::Sub, "/appdata/local/microsoft/windows/wer", Logs),
+    (Match::Sub, "/programdata/microsoft/windows/wer", Logs),
+    // browsers
+    (Match::Sub, "/google/chrome/user data", Browser),
+    (Match::Sub, "/microsoft/edge/user data", Browser),
+    (Match::Sub, "/bravesoftware/brave-browser/user data", Browser),
+    (Match::Sub, "/mozilla/firefox/profiles", Browser),
+    (Match::Sub, "/librewolf/profiles", Browser),
+    (Match::Sub, "/zen/profiles", Browser),
+    (Match::Sub, "/opera software", Browser),
+    (Match::Sub, "/vivaldi/user data", Browser),
+    // application caches
+    (Match::Sub, "/appdata/roaming/discord/cache", AppCache),
+    (Match::Sub, "/appdata/roaming/slack/cache", AppCache),
+    (Match::Sub, "/appdata/roaming/spotify", AppCache),
+    (Match::Sub, "/appdata/local/spotify/storage", AppCache),
+    (Match::Sub, "/appdata/local/microsoft/teams", AppCache),
+    (Match::Sub, "/appdata/local/nvidia", AppCache),
+    (Match::Sub, "/nvidia corporation/downloader", AppCache),
+    (Match::Sub, "/appdata/local/d3dscache", AppCache),
+    (Match::Sub, "/appdata/local/packages", AppCache),
+    // cloud sync
+    (Match::Sub, "/onedrive", CloudSync),
+    (Match::Sub, "/dropbox", CloudSync),
+    (Match::Sub, "/google drive", CloudSync),
+    (Match::Sub, "/googledrive", CloudSync),
+    (Match::Sub, "/icloud", CloudSync),
+    // games
+    (Match::Sub, "/steamapps", Games),
+    (Match::Sub, "/epic games", Games),
+    (Match::Sub, "/gog galaxy", Games),
+    (Match::Sub, "/riot games", Games),
+    (Match::Sub, "/battle.net", Games),
+    (Match::Sub, "/ubisoft", Games),
+    (Match::Sub, "/electronic arts", Games),
+    (Match::Sub, "/xboxgames", Games),
+    (Match::Sub, "/rockstar games", Games),
+    (Match::Sub, "/minecraft", Games),
+    // user folders
+    (Match::Sub, "/downloads", Downloads),
+];
+
+#[cfg(target_os = "macos")]
+#[rustfmt::skip]
+const DIR_PATH_RULES_PLATFORM: &[(Match, &str, CatId)] = &[
+    (Match::Sub, "/library/developer/xcode/ios devicesupport", DevCache),
+    (Match::Sub, "/library/developer/xcode/archives", DevBuild),
+    (Match::Sub, "/library/developer/coresimulator", DevCache),
+    (Match::Sub, "/library/application support/mobilesync/backup", Backup),
+    (Match::Sub, "/library/application support/google/chrome", Browser),
+    (Match::Sub, "/library/application support/firefox/profiles", Browser),
+    (Match::Sub, "/library/application support/microsoft edge", Browser),
+    (Match::Sub, "/library/application support/bravesoftware", Browser),
+    (Match::Sub, "/library/caches", AppCache),
+    (Match::Sub, "/library/logs", Logs),
+    (Match::Sub, "/.trash", RecycleBin),
+    (Match::Prefix, "/applications", Apps),
+    (Match::Prefix, "/opt/homebrew", Apps),
+    (Match::Prefix, "/usr/local/cellar", Apps),
+];
+
+#[cfg(target_os = "linux")]
+#[rustfmt::skip]
+const DIR_PATH_RULES_PLATFORM: &[(Match, &str, CatId)] = &[
+    (Match::Sub, "/.local/share/trash", RecycleBin),
+    (Match::Sub, "/.config/google-chrome", Browser),
+    (Match::Sub, "/.mozilla/firefox", Browser),
+    (Match::Prefix, "/var/lib/docker", VmDisk),
+    (Match::Prefix, "/var/log", Logs),
+    (Match::Prefix, "/snap", Apps),
+    (Match::Prefix, "/var/lib/flatpak", Apps),
+];
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[rustfmt::skip]
+const DIR_PATH_RULES_PLATFORM: &[(Match, &str, CatId)] = &[];
+
+/// Installed software, checked last because it is the broadest.
+#[rustfmt::skip]
+const DIR_PATH_RULES_TAIL: &[(Match, &str, CatId)] = &[
+    (Match::Sub, "c:/program files (x86)", Apps),
+    (Match::Sub, "c:/program files", Apps),
+    (Match::Sub, "/appdata/local/programs", Apps),
+];
+
+// --------------------------------------------------------------------------
+// Extension rules, applied per file. The size floor keeps trivia out of the
+// report: a 4 KB .log is noise, a 4 GB .log is a finding.
+// --------------------------------------------------------------------------
+
+const MB: u64 = 1024 * 1024;
+
+/// Sorted by extension (including the dot) for binary search.
+#[rustfmt::skip]
+const EXT_RULES: &[(&str, CatId, u64)] = &[
+    (".7z", DiscImage, 32 * MB),
+    (".ai", Media, 8 * MB),
+    (".aiff", Media, 8 * MB),
+    (".ape", Media, 8 * MB),
+    (".appimage", DiscImage, 32 * MB),
+    (".arw", Media, 8 * MB),
+    (".avhdx", VmDisk, 64 * MB),
+    (".avi", Media, 16 * MB),
+    (".backup", Backup, 8 * MB),
+    (".bak", Backup, 8 * MB),
+    (".blend", Media, 8 * MB),
+    (".bz2", DiscImage, 32 * MB),
+    (".c4d", Media, 8 * MB),
+    (".cab", DiscImage, 32 * MB),
+    (".cr2", Media, 8 * MB),
+    (".cue", DiscImage, 32 * MB),
+    (".deb", DiscImage, 32 * MB),
+    (".dmg", DiscImage, 32 * MB),
+    (".dmp", Logs, 8 * MB),
+    (".dng", Media, 8 * MB),
+    (".esd", DiscImage, 32 * MB),
+    (".etl", Logs, 8 * MB),
+    (".evtx", Logs, 8 * MB),
+    (".fbx", Media, 8 * MB),
+    (".flac", Media, 8 * MB),
+    (".flv", Media, 16 * MB),
+    (".gz", DiscImage, 32 * MB),
+    (".hdd", VmDisk, 64 * MB),
+    (".hdmp", Logs, 8 * MB),
+    (".img", DiscImage, 32 * MB),
+    (".iso", DiscImage, 32 * MB),
+    (".log", Logs, 8 * MB),
+    (".m4a", Media, 8 * MB),
+    (".m4v", Media, 16 * MB),
+    (".max", Media, 8 * MB),
+    (".mdf", DiscImage, 32 * MB),
+    (".mdmp", Logs, 8 * MB),
+    (".mkv", Media, 16 * MB),
+    (".mov", Media, 16 * MB),
+    (".mp3", Media, 8 * MB),
+    (".mp4", Media, 16 * MB),
+    (".mpeg", Media, 16 * MB),
+    (".mpg", Media, 16 * MB),
+    (".nef", Media, 8 * MB),
+    (".nrg", DiscImage, 32 * MB),
+    (".nsf", Backup, 8 * MB),
+    (".nvph", AppCache, 8 * MB),
+    (".ogg", Media, 8 * MB),
+    (".old", Backup, 8 * MB),
+    (".orig", Backup, 8 * MB),
+    (".ost", Backup, 8 * MB),
+    (".ova", VmDisk, 64 * MB),
+    (".ovf", VmDisk, 64 * MB),
+    (".pkg", DiscImage, 32 * MB),
+    (".psd", Media, 8 * MB),
+    (".pst", Backup, 8 * MB),
+    (".qcow2", VmDisk, 64 * MB),
+    (".rar", DiscImage, 32 * MB),
+    (".rpm", DiscImage, 32 * MB),
+    (".shadercache", AppCache, 8 * MB),
+    (".tar", DiscImage, 32 * MB),
+    (".tgz", DiscImage, 32 * MB),
+    (".tiff", Media, 8 * MB),
+    (".trace", Logs, 8 * MB),
+    (".ushaderprecache", AppCache, 8 * MB),
+    (".vdi", VmDisk, 64 * MB),
+    (".vhd", VmDisk, 64 * MB),
+    (".vhdx", VmDisk, 64 * MB),
+    (".vmdk", VmDisk, 64 * MB),
+    (".vob", Media, 16 * MB),
+    (".wav", Media, 8 * MB),
+    (".webm", Media, 16 * MB),
+    (".wim", DiscImage, 32 * MB),
+    (".wmv", Media, 16 * MB),
+    (".xip", DiscImage, 32 * MB),
+    (".xz", DiscImage, 32 * MB),
+    (".zip", DiscImage, 32 * MB),
+    (".zst", DiscImage, 32 * MB),
+];
+
+fn path_rule_hits(rules: &[(Match, &str, CatId)], path_slash_lower: &str) -> Option<CatId> {
+    for (kind, needle, key) in rules {
+        let hit = match kind {
+            Match::Sub => path_slash_lower.contains(needle),
+            Match::Prefix => path_slash_lower.starts_with(needle),
+        };
+        if hit {
+            return Some(*key);
+        }
+    }
+    None
+}
+
+/// Classify one directory, given whatever its parent was classified as.
+///
+/// `path_slash_lower` must already be lowercased with forward slashes. Names
+/// win outright (one binary search); overrides come next; only a directory
+/// with no inherited category pays for the full path-rule scan.
+pub fn resolve_category(
+    inherited: Option<CatId>,
+    path_slash_lower: &str,
+    name_lower: &str,
+) -> Option<CatId> {
+    if let Ok(idx) = DIR_NAME_RULES.binary_search_by(|(name, _)| (*name).cmp(name_lower)) {
+        return Some(DIR_NAME_RULES[idx].1);
+    }
+    for (needle, key) in OVERRIDE_PATH_RULES {
+        if path_slash_lower.contains(needle) {
+            return Some(*key);
+        }
+    }
+    if inherited.is_some() {
+        return inherited;
+    }
+    path_rule_hits(DIR_PATH_RULES_HEAD, path_slash_lower)
+        .or_else(|| path_rule_hits(DIR_PATH_RULES_PLATFORM, path_slash_lower))
+        .or_else(|| path_rule_hits(DIR_PATH_RULES_TAIL, path_slash_lower))
+}
+
+/// Return a category for a file by extension (lowercase, with the dot), if
+/// the file is large enough for the rule to be meaningful.
+pub fn match_extension(ext_lower: &str, size: u64) -> Option<CatId> {
+    let idx = EXT_RULES
+        .binary_search_by(|(ext, _, _)| (*ext).cmp(ext_lower))
+        .ok()?;
+    let (_, key, min_size) = EXT_RULES[idx];
+    (size >= min_size).then_some(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tables_are_sorted_for_binary_search() {
+        for pair in DIR_NAME_RULES.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "{} !< {}", pair[0].0, pair[1].0);
+        }
+        for pair in EXT_RULES.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "{} !< {}", pair[0].0, pair[1].0);
+        }
+    }
+
+    #[test]
+    fn keys_round_trip() {
+        for cat in ALL {
+            assert_eq!(CatId::from_key(cat.key()), Some(cat));
+            assert_eq!(CatId::from_index(cat.index()), Some(cat));
+        }
+        assert_eq!(CatId::from_key("nope"), None);
+    }
+
+    #[test]
+    fn name_rules_win_outright() {
+        assert_eq!(
+            resolve_category(
+                Some(Apps),
+                "c:/program files/app/node_modules",
+                "node_modules"
+            ),
+            Some(DevDeps)
+        );
+        assert_eq!(
+            resolve_category(None, "/home/me/target", "target"),
+            Some(DevBuild)
+        );
+    }
+
+    #[test]
+    fn overrides_beat_inheritance() {
+        assert_eq!(
+            resolve_category(
+                Some(Apps),
+                "c:/users/x/appdata/local/programs/.pixi/envs",
+                "envs"
+            ),
+            Some(DevDeps)
+        );
+    }
+
+    #[test]
+    fn inheritance_short_circuits_path_rules() {
+        assert_eq!(
+            resolve_category(Some(Games), "c:/games/steamapps/downloads", "downloads"),
+            Some(Games)
+        );
+    }
+
+    #[test]
+    fn path_rules_in_order() {
+        assert_eq!(
+            resolve_category(None, "c:/users/x/downloads", "downloads"),
+            Some(Downloads)
+        );
+        assert_eq!(
+            resolve_category(None, "c:/program files (x86)/thing", "thing"),
+            Some(Apps)
+        );
+        assert_eq!(
+            resolve_category(
+                None,
+                "c:/users/x/appdata/local/google/chrome/user data",
+                "user data"
+            ),
+            Some(Browser)
+        );
+        assert_eq!(
+            resolve_category(None, "c:/users/x/documents", "documents"),
+            None
+        );
+    }
+
+    #[test]
+    fn extension_floors() {
+        assert_eq!(match_extension(".iso", 32 * MB), Some(DiscImage));
+        assert_eq!(match_extension(".iso", 32 * MB - 1), None);
+        assert_eq!(match_extension(".log", 8 * MB), Some(Logs));
+        assert_eq!(match_extension(".vhdx", 64 * MB), Some(VmDisk));
+        assert_eq!(match_extension(".txt", u64::MAX), None);
+        assert_eq!(match_extension("(no extension)", u64::MAX), None);
+    }
+}
