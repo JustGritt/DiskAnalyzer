@@ -1,138 +1,4 @@
-"""A single self-contained HTML report.
-
-Everything is inlined into one file: no CDN, no network, no companion assets.
-You can open it from disk, move it, or send it to yourself and it still works.
-
-The treemap is the point of this report. A table tells you the ten biggest
-folders; a treemap shows you the shape of the whole drive at once, and which
-one branch is quietly holding a third of it.
-"""
-
-from __future__ import annotations
-
-import datetime as _datetime
-import json
-
-from . import categories
-from .insights import Report, build_tree
-from .scanner import ScanResult
-
-TREE_MIN_SIZE = 8 * 1024 * 1024
-
-
-def _volume_payload(result: ScanResult) -> list:
-    return [
-        {"root": root, "total": total, "used": used, "free": free}
-        for root, (total, used, free) in result.volumes.items()
-    ]
-
-
-def build_payload(report: Report) -> dict:
-    result = report.result
-    total = result.total_size or 1
-
-    return {
-        "generated": _datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "scan": {
-            "files": result.total_files,
-            "dirs": result.total_dirs,
-            "size": result.total_size,
-            "logical": result.logical_size,
-            "elapsed": result.elapsed,
-            "roots": [node.display for node in result.root_nodes],
-            "skipped": len(result.skipped),
-            "errors": len(result.errors),
-            "links": len(result.reparse_points),
-            "allocated": result.config.use_allocated,
-            "includeOs": result.config.include_os,
-        },
-        "volumes": _volume_payload(result),
-        "tree": build_tree(result, TREE_MIN_SIZE),
-        "reclaim": report.reclaimable,
-        "categories": [
-            {
-                "key": category.key,
-                "label": category.label,
-                "confidence": category.confidence,
-                "hint": category.hint,
-                "count": count,
-                "size": size,
-                "share": share,
-            }
-            for category, count, size, share in report.category_rows
-        ],
-        "folders": [
-            {
-                "path": node.display,
-                "size": node.total_size,
-                "files": node.total_files,
-                "cat": node.category or "other",
-            }
-            for node in report.top_folders
-        ],
-        "hotspots": [
-            {
-                "path": node.display,
-                "size": node.own_size,
-                "files": node.own_files,
-                "cat": node.category or "other",
-            }
-            for node in report.hotspots
-        ],
-        "files": [
-            {"path": path, "size": size, "mtime": mtime}
-            for size, path, mtime in report.top_files
-        ],
-        "oldFiles": [
-            {"path": path, "size": size, "mtime": mtime}
-            for size, path, mtime in report.old_files
-        ],
-        "extensions": [
-            {"ext": ext, "count": count, "size": size, "share": share}
-            for ext, count, size, share in report.extension_rows[:40]
-        ],
-        "ages": [
-            {"label": label, "count": count, "size": size, "share": size / total}
-            for label, count, size in report.age_rows
-        ],
-        "duplicates": [
-            {"size": group.size, "wasted": group.wasted, "paths": group.paths}
-            for group in report.duplicates[:150]
-        ],
-        "duplicatesTruncated": report.duplicates_truncated,
-        "osManaged": [
-            {"path": path, "size": size}
-            for path, size in sorted(result.os_managed, key=lambda item: -item[1])
-        ],
-        "skippedPaths": [
-            {"path": path, "reason": reason} for path, reason in result.skipped[:200]
-        ],
-        "categoryMeta": {
-            category.key: {
-                "label": category.label,
-                "confidence": category.confidence,
-                "hint": category.hint,
-            }
-            for category in categories.CATEGORIES
-        },
-    }
-
-
-def write_html(report: Report, path: str) -> str:
-    payload = build_payload(report)
-    # </script> inside the JSON would end the block early; escaping the slash
-    # keeps the document valid without changing what JSON.parse sees.
-    blob = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
-    document = TEMPLATE.replace("__PAYLOAD__", blob)
-    # One palette for the whole tool: the same category is the same colour in
-    # the treemap here and in the live UI sunburst.
-    document = document.replace("__PALETTE__", json.dumps(categories.COLORS))
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(document)
-    return path
-
-
-TEMPLATE = r"""<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -285,7 +151,13 @@ input[type=search]{width:100%;padding:9px 12px;border-radius:9px;border:1px soli
 <script>
 const DATA = JSON.parse(document.getElementById("payload").textContent);
 
-const PALETTE = __PALETTE__;
+const PALETTE = {
+  "dev-deps":"#8b5cf6","dev-build":"#6366f1","dev-cache":"#0ea5e9","temp":"#14b8a6",
+  "app-cache":"#06b6d4","browser":"#f59e0b","recycle-bin":"#84cc16","windows-old":"#ef4444",
+  "installer-cache":"#f97316","downloads":"#eab308","vm-disk":"#ec4899","disc-image":"#d946ef",
+  "logs":"#22c55e","backup":"#a855f7","cloud-sync":"#3b82f6","games":"#f43f5e",
+  "media":"#0891b2","apps":"#64748b","other":"#94a3b8"
+};
 const colorOf = k => PALETTE[k] || PALETTE.other;
 
 function fmtSize(n){
@@ -610,11 +482,11 @@ renderTable("ages", [
   bits.push("Sizes are " + (s.allocated ? "rounded up to whole clusters (on-disk estimate)"
     : "logical file sizes") + ".");
   if(s.skipped) bits.push("<b>" + fmtNum(s.skipped) + "</b> paths skipped" +
-    (s.includeOs ? "" : ", including the live Windows installation") + ".");
+    (s.includeOs ? "" : ", including the live " + esc(s.osName) + " installation") + ".");
   if(s.links) bits.push("<b>" + fmtNum(s.links) +
     "</b> junctions and symlinks were recorded but not followed, so nothing is counted twice.");
   if(s.errors) bits.push("<b>" + fmtNum(s.errors) +
-    "</b> paths could not be read; run as Administrator to reach more of them.");
+    "</b> paths could not be read; " + esc(s.errorsHint) + " to reach more of them.");
   host.appendChild(el("p", bits.join(" "))).className = "note";
 
   if(DATA.osManaged.length){
@@ -624,11 +496,10 @@ renderTable("ages", [
       { label:"File", cls:"path", cell:r => esc(r.path) },
     ], DATA.osManaged);
     host.appendChild(el("p",
-      "Windows sizes these itself. Change them through System settings rather than by deleting them."
+      esc(DATA.scan.osName) + " sizes these itself. Change them through System settings rather than by deleting them."
     )).className = "note";
   }
 })();
 </script>
 </body>
 </html>
-"""

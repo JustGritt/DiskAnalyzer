@@ -1,13 +1,6 @@
+# Rust build output.
+/target
+
 # Scan output: large, machine-specific, and regenerated on demand.
-reports/
-*.csv
-*.html
-
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-
-# Verification debris from browser-based report checks.
-.playwright-mcp/
-diskanalyzer-report.png
+# Anchored to the repo root so it never matches src/reports/.
+/reports/
