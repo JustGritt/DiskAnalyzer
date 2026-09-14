@@ -21,11 +21,13 @@ Windows, macOS and Linux.
 
 A **terminal report** with the volume gauge, where the space is, what kind of
 thing it is, the largest files, and the large files you have not touched in
-over a year.
+over a year (`--old-min-days` to change that).
 
 An **HTML report** (`report.html`) with an interactive treemap you can click
-into, plus sortable and filterable tables. One self-contained file: no network,
-no companion assets. Open it, move it, mail it to yourself; it still works.
+into, plus sortable and filterable tables: largest folders, folders holding the
+most loose files directly inside them, largest and oldest files, and what was
+skipped and why. One self-contained file: no network, no companion assets.
+Open it, move it, mail it to yourself; it still works.
 
 **CSV listings** (`files.csv`, `folders.csv`) for the questions the reports do
 not answer. Sort every file you own by size, filter to one extension, hand the
@@ -50,8 +52,11 @@ diskanalyzer --help                   all options
 | Option | Effect |
 | --- | --- |
 | `--include-os` | also scan the live OS folders that are skipped by default |
-| `--exclude PATH` | skip a folder (repeatable) |
+| `--exclude PATH` | skip a folder (repeatable; relative paths resolve against the current directory) |
 | `--exclude-name NAME` | skip any folder with this name (repeatable) |
+
+An `--exclude` that is not an existing folder, or an exclusion that ends up
+skipping nothing, is noted on stderr so a typo does not go unnoticed.
 | `--cross-filesystems` | descend into other mounted filesystems (Unix; off by default) |
 
 ### Sizing
@@ -197,9 +202,11 @@ own Library needs Full Disk Access. They are counted, listed in
 `unreadable.csv`, and reported as a count so the totals can be read honestly
 rather than looking complete when they are not.
 
-**Coverage.** The summary states what fraction of the volume's used space the
-scan accounted for. The remainder is the skipped OS folders, unreadable paths,
-and the differences above.
+**Coverage.** When a scan includes a whole volume, the summary states what
+fraction of the volume's used space it accounted for. The remainder is the
+skipped OS folders, unreadable paths, and the differences above. A scan of
+individual folders shows no percentage, since it covers part of the volume by
+design.
 
 ---
 

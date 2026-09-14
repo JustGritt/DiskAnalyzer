@@ -44,8 +44,15 @@ fn write(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
 }
 
+/// A temp directory under Cargo's target dir. The system temp folder would
+/// classify the whole fixture on Windows, where `AppData\Local\Temp` matches
+/// the Temp rule.
+fn temp_dir() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
+}
+
 fn build_fixture() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     let root = dir.path().join("root");
     fs::create_dir_all(root.join("a/node_modules")).unwrap();
     fs::create_dir_all(root.join("b")).unwrap();
@@ -145,7 +152,12 @@ fn totals_categories_links_skips_and_errors() {
     let table = node_table(&result);
     let a = &table[&fixture.root.join("a").display().to_string()];
     assert_eq!(*a, (15_000, 11, 1));
-    let nm = &table[&fixture.root.join("a/node_modules").display().to_string()];
+    let nm = &table[&fixture
+        .root
+        .join("a")
+        .join("node_modules")
+        .display()
+        .to_string()];
     assert_eq!(*nm, (5_000, 1, 0));
     assert!(table.contains_key(&fixture.root.join("empty").display().to_string()));
     assert!(!table.contains_key(&fixture.root.join("skipme").display().to_string()));
@@ -230,7 +242,7 @@ fn duplicates_need_matching_content_not_just_size() {
 #[test]
 fn reports_render_and_csvs_stream() {
     let fixture = build_fixture();
-    let out_dir = tempfile::tempdir().unwrap();
+    let out_dir = temp_dir();
     let output = OutputDir::create(&out_dir.path().join("nested/reports")).unwrap();
 
     let mut writer = FileListWriter::new(&output, 0).unwrap();
@@ -266,6 +278,12 @@ fn reports_render_and_csvs_stream() {
     assert!(text.contains("-- BIG AND UNTOUCHED"));
     assert!(text.contains("[dev-deps]"));
     assert!(text.contains("Nothing was modified, moved or deleted."));
+    // Only the user's own --exclude-name was skipped, and this is a folder
+    // scan: neither the OS hint nor a volume coverage share applies.
+    assert!(text.contains("Skipped  1 paths (user-excluded name)"));
+    assert!(!text.contains("--include-os"));
+    assert!(!text.contains("of used space"));
+    assert!(text.contains("not modified for 1 year or more"));
     let colored = terminal::render(&report, &result, true, 60);
     assert!(colored.contains("\x1b[1m"));
 
@@ -276,6 +294,9 @@ fn reports_render_and_csvs_stream() {
         "fixture is far below the 8 MB treemap floor"
     );
     assert!(page.contains(r#""duplicates":[{"size":30000"#));
+    assert!(page
+        .contains(r#""skippedByReason":[{"reason":"user-excluded name","count":1,"os":false}]"#));
+    assert!(page.contains(r#""oldMinDays":365"#));
     assert!(!page.contains("__PAYLOAD__"));
     html::write_html(&report, &result, &output).unwrap();
     assert!(output.join("report.html").is_file());
@@ -284,17 +305,22 @@ fn reports_render_and_csvs_stream() {
 #[test]
 fn binary_runs_end_to_end() {
     let fixture = build_fixture();
-    let out_dir = tempfile::tempdir().unwrap();
+    let out_dir = temp_dir();
     let reports = out_dir.path().join("run");
     let exe = env!("CARGO_BIN_EXE_diskanalyzer");
 
+    // Run from inside the fixture so `--exclude ./empty` is relative, and
+    // scan `.` so the root is relative too.
     let output = Command::new(exe)
+        .current_dir(&fixture.root)
         .args([
             "--no-color",
             "--quiet",
             "--threads",
             "2",
             "--csv-min-size",
+            "0",
+            "--folder-min-size",
             "0",
             "--duplicates",
         ])
@@ -303,18 +329,18 @@ fn binary_runs_end_to_end() {
             "1000",
             "--exclude-name",
             "skipme",
+            "--exclude-name",
+            "no-such-name",
+            "--exclude",
+            "./empty",
             "--out",
         ])
         .arg(&reports)
-        .arg(&fixture.root)
+        .arg(".")
         .output()
         .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("DISK ANALYZER"));
     assert!(stdout.contains("Reports written to"));
@@ -322,6 +348,17 @@ fn binary_runs_end_to_end() {
     assert!(reports.join("files.csv").is_file());
     assert!(reports.join("folders.csv").is_file());
     assert!(reports.join("report.html").is_file());
+
+    // The relative exclusion took effect, and only the unused name is noted.
+    let folders_csv = fs::read_to_string(reports.join("folders.csv")).unwrap();
+    assert!(folders_csv.contains(&*fixture.root.join("b").display().to_string()));
+    assert!(!folders_csv.contains(&*fixture.root.join("empty").display().to_string()));
+    assert!(stdout.contains("Skipped  2 paths (user-excluded, user-excluded name)"));
+    assert!(
+        stderr.contains("--exclude-name no-such-name matched no folder"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("--exclude ./empty"), "{stderr}");
 
     let missing = Command::new(exe)
         .arg(fixture.root.join("does-not-exist"))

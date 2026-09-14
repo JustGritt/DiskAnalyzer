@@ -110,6 +110,15 @@ input[type=search]{width:100%;padding:9px 12px;border-radius:9px;border:1px soli
   </div>
 
   <div class="panel">
+    <h2>Files directly inside</h2>
+    <p class="note" style="margin-top:0">Folders ranked by the files sitting directly in
+      them, not in their subfolders. A folder full of loose files shows up here even
+      when none of its subfolders is large.</p>
+    <input type="search" id="q-hotspots" placeholder="Filter folders...">
+    <div id="hotspots"></div>
+  </div>
+
+  <div class="panel">
     <h2>Largest files</h2>
     <input type="search" id="q-files" placeholder="Filter files...">
     <div id="files"></div>
@@ -117,8 +126,7 @@ input[type=search]{width:100%;padding:9px 12px;border-radius:9px;border:1px soli
 
   <div class="panel" id="old-panel">
     <h2>Big and untouched</h2>
-    <p class="note" style="margin-top:0">Large files you have not modified in over a
-      year. Usually the easiest thing to look at first.</p>
+    <p class="note" style="margin-top:0" id="old-note"></p>
     <div id="oldfiles"></div>
   </div>
 
@@ -175,6 +183,10 @@ function fmtAge(ts){
   if(d < 60) return d + "d";
   if(d < 730) return Math.floor(d/30) + "mo";
   return Math.floor(d/365) + "y";
+}
+function fmtDays(d){
+  if(d > 0 && d % 365 === 0) return (d/365 === 1) ? "1 year" : (d/365) + " years";
+  return d === 1 ? "1 day" : d + " days";
 }
 function esc(s){
   return String(s).replace(/[&<>"']/g, c =>
@@ -417,6 +429,14 @@ filterable("q-folders", "folders", [
   { label:"Folder", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
 ], DATA.folders, r => r.path);
 
+/* folders ranked by the files directly inside them */
+filterable("q-hotspots", "hotspots", [
+  { label:"Files here", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
+  { label:"Count", cls:"num", sort:r => r.files, cell:r => fmtNum(r.files) },
+  { label:"Category", sort:r => r.cat, cell:r => tagFor(r.cat) },
+  { label:"Folder", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
+], DATA.hotspots, r => r.path);
+
 /* files */
 filterable("q-files", "files", [
   { label:"Size", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
@@ -426,6 +446,9 @@ filterable("q-files", "files", [
 
 /* old files */
 if(DATA.oldFiles.length){
+  document.getElementById("old-note").textContent =
+    "Files over " + fmtSize(DATA.scan.oldMinSize) + " you have not modified for " +
+    fmtDays(DATA.scan.oldMinDays) + " or more. Usually the easiest thing to look at first.";
   renderTable("oldfiles", [
     { label:"Size", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
     { label:"Age", cls:"num", sort:r => r.mtime, cell:r => fmtAge(r.mtime) },
@@ -481,13 +504,30 @@ renderTable("ages", [
   bits.push("Roots scanned: <b>" + DATA.scan.roots.map(esc).join(", ") + "</b>.");
   bits.push("Sizes are " + (s.allocated ? "rounded up to whole clusters (on-disk estimate)"
     : "logical file sizes") + ".");
-  if(s.skipped) bits.push("<b>" + fmtNum(s.skipped) + "</b> paths skipped" +
-    (s.includeOs ? "" : ", including the live " + esc(s.osName) + " installation") + ".");
+  if(s.skipped){
+    const reasons = s.skippedByReason || [];
+    bits.push("<b>" + fmtNum(s.skipped) + "</b> paths skipped (" +
+      reasons.map(r => esc(r.reason) + ": " + fmtNum(r.count)).join(", ") + ")" +
+      (reasons.some(r => r.os) ? ", including parts of the live " + esc(s.osName) +
+        " installation that --include-os would scan" : "") + ".");
+  }
   if(s.links) bits.push("<b>" + fmtNum(s.links) +
     "</b> junctions and symlinks were recorded but not followed, so nothing is counted twice.");
   if(s.errors) bits.push("<b>" + fmtNum(s.errors) +
     "</b> paths could not be read; " + esc(s.errorsHint) + " to reach more of them.");
   host.appendChild(el("p", bits.join(" "))).className = "note";
+
+  if(DATA.skippedPaths.length){
+    host.appendChild(el("h2", "Skipped folders"));
+    renderTable(host.appendChild(el("div")), [
+      { label:"Folder", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
+      { label:"Reason", sort:r => r.reason, cell:r => esc(r.reason) },
+    ], DATA.skippedPaths);
+    if(s.skipped > DATA.skippedPaths.length){
+      host.appendChild(el("p", "Showing the first " + fmtNum(DATA.skippedPaths.length) +
+        " of " + fmtNum(s.skipped) + " skipped folders.")).className = "note";
+    }
+  }
 
   if(DATA.osManaged.length){
     host.appendChild(el("h2", "OS-managed files"));

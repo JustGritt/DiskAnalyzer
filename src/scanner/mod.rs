@@ -33,7 +33,7 @@ use std::thread;
 use crossbeam_channel::unbounded;
 
 use crate::categories::{self, CatId, NUM_CATEGORIES};
-use crate::exclusions::ExclusionSet;
+use crate::exclusions::{self, ExclusionSet};
 use crate::platform;
 use crate::util::now_epoch;
 
@@ -287,11 +287,14 @@ pub fn scan(
     result.started_at = started;
     result.now = now;
 
-    let exclusions = ExclusionSet::new(
-        config.include_os,
-        &config.exclude_dirs,
-        &config.exclude_names,
-    );
+    // Roots are made absolute below; exclusions must be too, or a relative
+    // `--exclude` would silently never match anything.
+    let exclude_dirs: Vec<String> = config
+        .exclude_dirs
+        .iter()
+        .map(|path| exclusions::absolute_display(path))
+        .collect();
+    let exclusions = ExclusionSet::new(config.include_os, &exclude_dirs, &config.exclude_names);
     let mut allowed_devices = platform::extra_allowed_devices();
     let mut seen_volumes = HashSet::new();
     let mut root_jobs = Vec::new();

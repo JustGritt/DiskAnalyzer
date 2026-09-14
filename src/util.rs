@@ -82,6 +82,21 @@ pub fn human_age(timestamp: f64, now: f64) -> String {
     }
 }
 
+/// A day count in the unit a person would say: whole years as years
+/// (`365` -> "1 year"), anything else as days (`90` -> "90 days").
+pub fn human_days(days: u64) -> String {
+    if days > 0 && days.is_multiple_of(365) {
+        match days / 365 {
+            1 => "1 year".to_string(),
+            years => format!("{years} years"),
+        }
+    } else if days == 1 {
+        "1 day".to_string()
+    } else {
+        format!("{days} days")
+    }
+}
+
 /// Shorten a path but keep both ends, which is where the meaning lives.
 pub fn truncate_middle(text: &str, width: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
@@ -323,6 +338,17 @@ mod tests {
         assert_eq!(human_age(now - 5.0 * 86400.0, now), "5d");
         assert_eq!(human_age(now - 100.0 * 86400.0, now), "3mo");
         assert_eq!(human_age(now - 800.0 * 86400.0, now), "2y");
+    }
+
+    #[test]
+    fn day_counts() {
+        assert_eq!(human_days(0), "0 days");
+        assert_eq!(human_days(1), "1 day");
+        assert_eq!(human_days(90), "90 days");
+        assert_eq!(human_days(364), "364 days");
+        assert_eq!(human_days(365), "1 year");
+        assert_eq!(human_days(400), "400 days");
+        assert_eq!(human_days(730), "2 years");
     }
 
     #[test]

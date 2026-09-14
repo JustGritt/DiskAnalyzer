@@ -11,6 +11,7 @@ use std::io::{self, Write};
 use super::csv::timestamp;
 use super::sink::OutputDir;
 use crate::categories::{CatId, ALL};
+use crate::exclusions;
 use crate::insights::{build_tree, Report};
 use crate::platform;
 use crate::scanner::{FileRec, ScanResult};
@@ -42,6 +43,28 @@ fn folder_row(result: &ScanResult, id: u32, size: u64, files: u64) -> Json {
         .set("cat", node.category.unwrap_or(CatId::Other).key())
 }
 
+/// Skip counts per reason, most common first, so the page can say whether
+/// `--include-os` is relevant at all.
+fn skipped_by_reason(result: &ScanResult) -> Vec<Json> {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for (_, reason) in &result.skipped {
+        match counts.iter_mut().find(|(r, _)| *r == *reason) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((reason, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    counts
+        .into_iter()
+        .map(|(reason, count)| {
+            Json::obj()
+                .set("reason", reason)
+                .set("count", count)
+                .set("os", exclusions::is_os_reason(reason))
+        })
+        .collect()
+}
+
 pub fn build_payload(report: &Report, result: &ScanResult) -> Json {
     let total = result.total_size.max(1) as f64;
 
@@ -60,6 +83,9 @@ pub fn build_payload(report: &Report, result: &ScanResult) -> Json {
                 .collect::<Vec<_>>(),
         )
         .set("skipped", result.skipped.len())
+        .set("skippedByReason", skipped_by_reason(result))
+        .set("oldMinDays", result.config.old_file_min_days)
+        .set("oldMinSize", result.config.old_file_min_size)
         .set("errors", result.errors.len())
         .set("links", result.links.len())
         .set("allocated", result.config.use_allocated)

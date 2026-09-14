@@ -9,10 +9,13 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 
 use crate::categories::Confidence;
+use crate::exclusions;
 use crate::insights::Report;
 use crate::platform;
 use crate::scanner::ScanResult;
-use crate::util::{human_age, human_count, human_duration, human_size, truncate_middle};
+use crate::util::{
+    human_age, human_count, human_days, human_duration, human_size, truncate_middle,
+};
 
 /// ANSI colors, or transparent no-ops when the terminal cannot show them.
 pub struct Palette {
@@ -185,15 +188,26 @@ impl TerminalReport<'_> {
 
     fn render_scan_summary(&mut self) {
         let result = self.result;
-        let used_total: u64 = result.volumes.iter().map(|(_, (_t, used, _f))| *used).sum();
-        let scanned_share = result.total_size as f64 / used_total.max(1) as f64;
+        // Coverage only means something when a whole volume was asked for;
+        // a folder scan is a sliver of the volume by design.
+        let scans_volume = result
+            .root_ids
+            .iter()
+            .any(|&id| platform::is_volume_root(&result.nodes[id as usize].name));
+        let coverage = if scans_volume {
+            let used_total: u64 = result.volumes.iter().map(|(_, (_t, used, _f))| *used).sum();
+            let scanned_share = result.total_size as f64 / used_total.max(1) as f64;
+            format!("  ({:.0}% of used space)", scanned_share * 100.0)
+        } else {
+            String::new()
+        };
         self.blank();
         let text = format!(
-            " Scanned  {} files in {} folders  =  {}  ({:.0}% of used space)",
+            " Scanned  {} files in {} folders  =  {}{}",
             human_count(result.total_files),
             human_count(result.total_dirs),
             self.c.paint(&human_size(result.total_size), &["bold"]),
-            scanned_share * 100.0
+            coverage
         );
         self.line(&text);
         self.line(&format!(" Time     {}", human_duration(result.elapsed)));
@@ -202,11 +216,21 @@ impl TerminalReport<'_> {
             let mut reasons: Vec<&str> = result.skipped.iter().map(|(_, reason)| *reason).collect();
             reasons.sort_unstable();
             reasons.dedup();
+            // Only the OS tables are lifted by --include-os; suggesting it for
+            // the user's own exclusions would be wrong.
+            let hint = if reasons
+                .iter()
+                .any(|reason| exclusions::is_os_reason(reason))
+            {
+                self.c.paint("  --include-os to scan them", &["dim"])
+            } else {
+                String::new()
+            };
             let text = format!(
                 " Skipped  {} paths ({}){}",
                 result.skipped.len(),
                 reasons.join(", "),
-                self.c.paint("  --include-os to scan them", &["dim"])
+                hint
             );
             self.line(&text);
         }
@@ -373,11 +397,10 @@ impl TerminalReport<'_> {
             return;
         }
         let config = &self.result.config;
-        let years = (config.old_file_min_days / 365).max(1);
         self.heading(&format!(
-            "BIG AND UNTOUCHED  (over {}, not modified in {}+ year)",
+            "BIG AND UNTOUCHED  (over {}, not modified for {} or more)",
             human_size(config.old_file_min_size),
-            years
+            human_days(config.old_file_min_days)
         ));
         self.note("large files you have not written to in a long time: the best place to start");
         self.blank();

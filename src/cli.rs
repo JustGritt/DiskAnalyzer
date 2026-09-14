@@ -1,13 +1,15 @@
 //! Command-line entry point: argument parsing and wiring.
 
+use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 
+use crate::exclusions;
 use crate::insights::build_report;
 use crate::platform;
 use crate::reports::csv::{write_error_csv, write_folder_csv, FileListWriter};
@@ -161,6 +163,47 @@ impl ProgressLine {
     }
 }
 
+/// `--exclude` paths and `--exclude-name` names that skipped nothing, so a
+/// typo is reported instead of quietly scanning what the user meant to skip.
+fn unmatched_exclusions<'a>(
+    exclude: &'a [String],
+    exclude_name: &'a [String],
+    skipped: &[(String, &'static str)],
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    let skipped_dirs: HashSet<String> = skipped
+        .iter()
+        .filter(|(_, reason)| *reason == exclusions::USER_EXCLUDED)
+        .map(|(path, _)| exclusions::normalize_key(path))
+        .collect();
+    let skipped_names: HashSet<String> = skipped
+        .iter()
+        .filter(|(_, reason)| *reason == exclusions::USER_EXCLUDED_NAME)
+        .filter_map(|(path, _)| {
+            path.trim_end_matches(['\\', '/'])
+                .rsplit(['\\', '/'])
+                .next()
+        })
+        .map(str::to_lowercase)
+        .collect();
+    let dirs = exclude
+        .iter()
+        .filter(|path| {
+            let key = exclusions::normalize_key(&exclusions::absolute_display(path));
+            !skipped_dirs.contains(&key)
+        })
+        .map(String::as_str)
+        .collect();
+    let names = exclude_name
+        .iter()
+        .filter(|name| {
+            let name = name.trim().to_lowercase();
+            !name.is_empty() && !skipped_names.contains(&name)
+        })
+        .map(String::as_str)
+        .collect();
+    (dirs, names)
+}
+
 fn default_output_dir() -> PathBuf {
     let stamp = match platform::local_datetime(now_epoch()) {
         Some((y, mo, d, h, mi, s)) => format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}"),
@@ -199,6 +242,13 @@ pub fn run_with(args: Args) -> i32 {
         eprintln!(
             "--cluster-size only applies on Windows; --allocated uses real block counts here."
         );
+    }
+    for path in &args.exclude {
+        if !Path::new(path).is_dir() {
+            eprintln!(
+                "Note: --exclude {path} is not an existing folder, so it will not skip anything."
+            );
+        }
     }
 
     let config = ScanConfig {
@@ -297,6 +347,16 @@ pub fn run_with(args: Args) -> i32 {
         if let Err(err) = writer.finish() {
             eprintln!("Warning: files.csv was not fully written: {err}");
         }
+    }
+    let (unused_dirs, unused_names) =
+        unmatched_exclusions(&args.exclude, &args.exclude_name, &result.skipped);
+    for path in unused_dirs {
+        if Path::new(path).is_dir() {
+            eprintln!("Note: --exclude {path} matched no folder inside the scanned roots.");
+        }
+    }
+    for name in unused_names {
+        eprintln!("Note: --exclude-name {name} matched no folder in this scan.");
     }
 
     let report = build_report(&mut result, args.top, args.files, args.duplicates);
@@ -408,5 +468,25 @@ mod tests {
         assert_eq!(args.old_min_size, 1_610_612_736);
         assert_eq!(args.roots, vec![PathBuf::from("/tmp")]);
         assert!(Args::try_parse_from(["diskanalyzer", "--csv-min-size", "lots"]).is_err());
+    }
+
+    #[test]
+    fn exclusions_that_skipped_nothing_are_reported() {
+        let hit = exclusions::absolute_display("hit");
+        let hit_name = platform::join_display(&exclusions::absolute_display("x"), "Build");
+        let skipped = vec![
+            (hit.clone(), exclusions::USER_EXCLUDED),
+            (hit_name, exclusions::USER_EXCLUDED_NAME),
+            (exclusions::absolute_display("os"), "windows os"),
+        ];
+        let exclude = vec!["./hit".to_string(), "miss".to_string(), "os".to_string()];
+        let names = vec![
+            "build".to_string(),
+            "nothing-here".to_string(),
+            " ".to_string(),
+        ];
+        let (dirs, unused_names) = unmatched_exclusions(&exclude, &names, &skipped);
+        assert_eq!(dirs, vec!["miss", "os"]);
+        assert_eq!(unused_names, vec!["nothing-here"]);
     }
 }
