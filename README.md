@@ -33,6 +33,12 @@ Open it, move it, mail it to yourself; it still works.
 not answer. Sort every file you own by size, filter to one extension, hand the
 list to another tool.
 
+**`report.json`**, the same data the HTML report shows, for scripts and for
+keeping a history of scans. It also records the settings the scan ran with
+(roots, exclusions, sizing, floors). The document carries `"schema":
+"diskanalyzer.report"` and a `schemaVersion`, which only changes when an
+existing key changes meaning; new keys may appear at any time.
+
 Reports land in `reports/scan-<timestamp>/` unless you pass `--out`.
 
 ---
@@ -85,7 +91,7 @@ skipping nothing, is noted on stderr so a typo does not go unnoticed.
 | `--out DIR` | report directory |
 | `--csv-min-size SIZE` | size floor for `files.csv`; `0` lists every file (default 10MB) |
 | `--folder-min-size SIZE` | size floor for `folders.csv`; `0` lists every folder (default 1MB) |
-| `--no-html`, `--no-csv` | skip an output format |
+| `--no-html`, `--no-csv`, `--no-json` | skip an output format |
 | `--no-color`, `--quiet` | plain text; no progress line |
 | `--threads N` | worker threads (default: twice the CPU count, at most 16) |
 
@@ -226,8 +232,10 @@ src/
   platform/           Windows, macOS and Linux specifics
   reports/
     terminal.rs       the terminal report
+    payload.rs        the report as one JSON document
     html.rs           the self-contained HTML report
     template.html     its markup, CSS and treemap script
+    json.rs           report.json
     csv.rs            the CSV listings
     sink.rs           the only module that creates files
   util.rs             formatting, size parsing, JSON

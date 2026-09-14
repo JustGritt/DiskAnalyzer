@@ -10,13 +10,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use diskanalyzer::categories::CatId;
-use diskanalyzer::insights::build_report;
+use diskanalyzer::insights::{build_report, ReportOptions};
+use diskanalyzer::platform;
 use diskanalyzer::reports::csv::{write_folder_csv, FileListWriter};
 use diskanalyzer::reports::html;
 use diskanalyzer::reports::sink::OutputDir;
 use diskanalyzer::reports::terminal;
 use diskanalyzer::scanner::{scan, FileSink, ScanConfig, ScanResult, SECONDS_PER_DAY};
-use diskanalyzer::util::now_epoch;
+use diskanalyzer::util::{now_epoch, Json};
 
 const DUP_BYTES: usize = 30_000;
 
@@ -125,6 +126,13 @@ fn config_for(fixture: &Fixture, threads: usize) -> ScanConfig {
     }
 }
 
+fn with_duplicates() -> ReportOptions {
+    ReportOptions {
+        with_duplicates: true,
+        ..ReportOptions::default()
+    }
+}
+
 fn node_table(result: &ScanResult) -> BTreeMap<String, (u64, u64, u32)> {
     let paths = result.all_paths();
     result
@@ -223,7 +231,7 @@ fn parallel_scan_matches_serial_scan() {
 fn duplicates_need_matching_content_not_just_size() {
     let fixture = build_fixture();
     let mut result = scan(&config_for(&fixture, 4), None, 0, None);
-    let report = build_report(&mut result, 25, 30, true);
+    let report = build_report(&mut result, &with_duplicates());
     assert_eq!(report.duplicates.len(), 1);
     let group = &report.duplicates[0];
     assert_eq!(group.size, DUP_BYTES as u64);
@@ -270,7 +278,7 @@ fn reports_render_and_csvs_stream() {
         "{first_row}"
     );
 
-    let report = build_report(&mut result, 25, 30, true);
+    let report = build_report(&mut result, &with_duplicates());
     let text = terminal::render(&report, &result, false, 100);
     assert!(text.contains("DISK ANALYZER"));
     assert!(text.contains("-- WHERE THE SPACE IS"));
@@ -348,6 +356,29 @@ fn binary_runs_end_to_end() {
     assert!(reports.join("files.csv").is_file());
     assert!(reports.join("folders.csv").is_file());
     assert!(reports.join("report.html").is_file());
+
+    let json = fs::read_to_string(reports.join("report.json")).unwrap();
+    let doc = Json::parse(&json).unwrap();
+    assert_eq!(doc.get("schemaVersion").and_then(Json::as_u64), Some(1));
+    assert_eq!(
+        doc.get("schema").and_then(Json::as_str),
+        Some("diskanalyzer.report")
+    );
+    let config = doc.get("config").unwrap();
+    let roots: Vec<String> = config
+        .get("roots")
+        .and_then(Json::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(Json::as_str)
+        .map(platform::fold_case)
+        .collect();
+    assert_eq!(
+        roots,
+        vec![platform::fold_case(&fixture.root.display().to_string())]
+    );
+    assert_eq!(config.get("folderMinSize").and_then(Json::as_u64), Some(0));
+    assert!(doc.get("generatedEpoch").and_then(Json::as_f64).unwrap() > 0.0);
 
     // The relative exclusion took effect, and only the unused name is noted.
     let folders_csv = fs::read_to_string(reports.join("folders.csv")).unwrap();

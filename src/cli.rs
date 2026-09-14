@@ -10,10 +10,12 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 
 use crate::exclusions;
-use crate::insights::build_report;
+use crate::insights::{build_report, ReportOptions};
 use crate::platform;
 use crate::reports::csv::{write_error_csv, write_folder_csv, FileListWriter};
-use crate::reports::html::write_html;
+use crate::reports::html::write_html_payload;
+use crate::reports::json::write_json;
+use crate::reports::payload::build_payload;
 use crate::reports::sink::OutputDir;
 use crate::reports::terminal;
 use crate::scanner::{scan, FileSink, ScanConfig, ScanProgress};
@@ -98,6 +100,9 @@ pub struct Args {
     /// skip the CSV listings
     #[arg(long, help_heading = "Output")]
     pub no_csv: bool,
+    /// skip report.json, the machine-readable copy of the report
+    #[arg(long, help_heading = "Output")]
+    pub no_json: bool,
     /// disable ANSI color
     #[arg(long, help_heading = "Output")]
     pub no_color: bool,
@@ -270,8 +275,9 @@ pub fn run_with(args: Args) -> i32 {
 
     let want_files = !args.no_csv;
     let want_html = !args.no_html;
+    let want_json = !args.no_json;
     let out_dir = args.out.clone().unwrap_or_else(default_output_dir);
-    let output = if want_files || want_html {
+    let output = if want_files || want_html || want_json {
         match OutputDir::create(&out_dir) {
             Ok(output) => Some(output),
             Err(err) => {
@@ -359,7 +365,14 @@ pub fn run_with(args: Args) -> i32 {
         eprintln!("Note: --exclude-name {name} matched no folder in this scan.");
     }
 
-    let report = build_report(&mut result, args.top, args.files, args.duplicates);
+    let options = ReportOptions {
+        top_n: args.top,
+        file_n: args.files,
+        with_duplicates: args.duplicates,
+        csv_min_size: args.csv_min_size,
+        folder_min_size: args.folder_min_size,
+    };
+    let report = build_report(&mut result, &options);
 
     let color = !args.no_color && terminal::supports_color();
     let text = terminal::render(&report, &result, color, terminal::terminal_width());
@@ -384,10 +397,18 @@ pub fn run_with(args: Args) -> i32 {
                 }
             }
         }
-        if want_html {
-            match write_html(&report, &result, output) {
+        // One payload for both documents, so they cannot disagree.
+        let payload = (want_html || want_json).then(|| build_payload(&report, &result));
+        if let (true, Some(payload)) = (want_html, &payload) {
+            match write_html_payload(payload, output) {
                 Ok(()) => written.push(("report.html", output.join("report.html"))),
                 Err(err) => eprintln!("Warning: report.html was not written: {err}"),
+            }
+        }
+        if let (true, Some(payload)) = (want_json, &payload) {
+            match write_json(payload, output) {
+                Ok(()) => written.push(("report.json", output.join("report.json"))),
+                Err(err) => eprintln!("Warning: report.json was not written: {err}"),
             }
         }
     }

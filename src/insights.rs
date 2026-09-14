@@ -35,8 +35,36 @@ pub struct Reclaimable {
     pub duplicates: u64,
 }
 
+/// Report settings that are not part of the scan itself. Kept on the
+/// `Report` so every writer (and `report.json`) can state what it used.
+#[derive(Clone, Debug)]
+pub struct ReportOptions {
+    /// Folders per ranking (`--top`).
+    pub top_n: usize,
+    /// Files per ranking (`--files`).
+    pub file_n: usize,
+    pub with_duplicates: bool,
+    /// Floor for `files.csv` (`--csv-min-size`).
+    pub csv_min_size: u64,
+    /// Floor for `folders.csv` (`--folder-min-size`).
+    pub folder_min_size: u64,
+}
+
+impl Default for ReportOptions {
+    fn default() -> ReportOptions {
+        ReportOptions {
+            top_n: 25,
+            file_n: 30,
+            with_duplicates: false,
+            csv_min_size: 10 * 1024 * 1024,
+            folder_min_size: 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Report {
+    pub options: ReportOptions,
     /// Node ids, largest first.
     pub top_folders: Vec<u32>,
     pub hotspots: Vec<u32>,
@@ -178,13 +206,11 @@ pub fn find_duplicates(
     (groups, truncated)
 }
 
-pub fn build_report(
-    result: &mut ScanResult,
-    top_n: usize,
-    file_n: usize,
-    with_duplicates: bool,
-) -> Report {
+pub fn build_report(result: &mut ScanResult, options: &ReportOptions) -> Report {
+    let top_n = options.top_n;
+    let file_n = options.file_n;
     let mut report = Report {
+        options: options.clone(),
         top_folders: collapse_chains(result, top_n),
         ..Default::default()
     };
@@ -247,7 +273,7 @@ pub fn build_report(
     report.top_files = result.top_files.iter().take(file_n).cloned().collect();
     report.old_files = result.sorted_old_files().into_iter().take(file_n).collect();
 
-    if with_duplicates {
+    if options.with_duplicates {
         let (groups, truncated) =
             find_duplicates(result, DUPLICATE_MAX_GROUPS, DUPLICATE_READ_BUDGET);
         report.duplicates = groups;
