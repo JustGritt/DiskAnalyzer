@@ -70,6 +70,10 @@ input[type=search]{width:100%;padding:9px 12px;border-radius:9px;border:1px soli
 .dupgroup .hd{font-weight:650;margin-bottom:5px}
 .dupgroup ul{margin:0;padding-left:17px;font-family:ui-monospace,Consolas,monospace;font-size:12px;
   word-break:break-all;color:var(--muted)}
+h3{font-size:12px;margin:18px 0 6px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.grow{color:var(--review);font-weight:600}
+.shrink{color:var(--safe);font-weight:600}
+.warn{color:var(--review)}
 .controls{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin-bottom:12px}
 .controls input[type=search]{flex:1 1 260px;width:auto;margin-bottom:0}
 .controls label{color:var(--muted);font-size:13px;white-space:nowrap;cursor:pointer}
@@ -92,6 +96,18 @@ td .kinds{color:var(--muted);font-size:12px}
   </p>
 
   <div class="cards" id="cards"></div>
+
+  <div class="panel" id="compare-panel">
+    <h2 id="compare-title">Changes</h2>
+    <div id="compare-warnings"></div>
+    <p class="note" style="margin-top:0" id="compare-summary"></p>
+    <h3>Grew</h3>
+    <div id="cmp-grew"></div>
+    <h3>Shrank</h3>
+    <div id="cmp-shrank"></div>
+    <h3>Removed</h3>
+    <div id="cmp-removed"></div>
+  </div>
 
   <div class="panel">
     <h2>Treemap</h2>
@@ -232,6 +248,7 @@ function fmtAge(ts, now){
   if(d < 730) return Math.floor(d/30) + "mo";
   return Math.floor(d/365) + "y";
 }
+const fmtDelta = n => (n > 0 ? "+" : n < 0 ? "-" : "") + fmtSize(Math.abs(n));
 function fmtDays(d){
   if(d > 0 && d % 365 === 0) return (d/365 === 1) ? "1 year" : (d/365) + " years";
   return d === 1 ? "1 day" : d + " days";
@@ -486,6 +503,34 @@ document.getElementById("reclaim").innerHTML =
   (DATA.reclaim.duplicates ? ", and <b>" + fmtSize(DATA.reclaim.duplicates) +
     "</b> is held by duplicate copies" : "") +
   ". DiskAnalyzer only reports these; removing anything is your decision, made elsewhere.";
+
+/* changes since the --compare baseline */
+(function changes(){
+  const c = DATA.compare;
+  if(!c){ document.getElementById("compare-panel").remove(); return; }
+  document.getElementById("compare-title").textContent = "Changes since " + c.base;
+  const warnings = document.getElementById("compare-warnings");
+  for(const w of c.warnings) warnings.appendChild(el("p", esc(w))).className = "note warn";
+  const free = c.volumes.map(v => "free space on " + esc(v.root) + " " + fmtSize(v.freeBefore) +
+    " &rarr; " + fmtSize(v.freeAfter)).join("; ");
+  document.getElementById("compare-summary").innerHTML =
+    "Scanned <b>" + fmtSize(c.beforeTotal) + " &rarr; " + fmtSize(c.afterTotal) + "</b> (" +
+    fmtDelta(c.afterTotal - c.beforeTotal) + ")" + (free ? "; " + free : "") + ". " +
+    "Each row is the folder where a change happened, not every folder above it; changes under " +
+    fmtSize(c.minChange) + " are not listed. Compared with <code>" + esc(c.baseDir) + "</code>.";
+  const columns = [
+    { label:"Change", cls:"num", sort:r => r.delta, cell:r =>
+        '<span class="' + (r.delta > 0 ? "grow" : "shrink") + '">' + fmtDelta(r.delta) + '</span>' },
+    { label:"Before", cls:"num", sort:r => r.before === null ? -1 : r.before, cell:r =>
+        r.before === null ? "new" : fmtSize(r.before) },
+    { label:"After", cls:"num", sort:r => r.after === null ? -1 : r.after, cell:r =>
+        r.after === null ? esc(r.status) : fmtSize(r.after) + (r.status === "unreadable" ? " (unreadable)" : "") },
+    { label:"Folder", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
+  ];
+  renderTable("cmp-grew", columns, c.grew);
+  renderTable("cmp-shrank", columns, c.shrank);
+  renderTable("cmp-removed", columns, c.removed);
+})();
 
 /* reclaimable folders */
 (function reclaimFolders(){

@@ -3,6 +3,7 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::categories::{CatId, Confidence, ALL};
+use crate::compare::Comparison;
 use crate::exclusions;
 use crate::platform;
 use crate::projects;
@@ -127,6 +128,8 @@ pub struct Report {
     pub duplicates_truncated: bool,
     pub reclaimable: Reclaimable,
     pub reclaim_folders: ReclaimFolders,
+    /// Set by the CLI when `--compare` names a baseline.
+    pub comparison: Option<Comparison>,
 }
 
 /// Largest `total_size` among each node's direct children.

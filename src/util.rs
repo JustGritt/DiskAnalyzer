@@ -48,6 +48,16 @@ pub fn human_size(num_bytes: u64) -> String {
     unreachable!()
 }
 
+/// A signed size change: `+5.2 GB`, `-2.0 GB`, `0 B`.
+pub fn human_delta(delta: i64) -> String {
+    let size = human_size(delta.unsigned_abs());
+    match delta.signum() {
+        1 => format!("+{size}"),
+        -1 => format!("-{size}"),
+        _ => size,
+    }
+}
+
 pub fn human_count(num: u64) -> String {
     group_thousands(&num.to_string())
 }
@@ -564,6 +574,15 @@ impl From<u32> for Json {
         Json::Int(v as u64)
     }
 }
+/// Negative values become `Float`; exact up to 2^53, far beyond any drive.
+impl From<i64> for Json {
+    fn from(v: i64) -> Json {
+        match u64::try_from(v) {
+            Ok(n) => Json::Int(n),
+            Err(_) => Json::Float(v as f64),
+        }
+    }
+}
 impl From<usize> for Json {
     fn from(v: usize) -> Json {
         Json::Int(v as u64)
@@ -612,6 +631,16 @@ mod tests {
         assert_eq!(human_size(1_099_511_627_776), "1.0 TB");
         assert_eq!(human_size(1_125_899_906_842_624), "1.0 PB");
         assert_eq!(human_size(2_000 * 1_125_899_906_842_624), "2,000.0 PB");
+    }
+
+    #[test]
+    fn deltas_carry_a_sign() {
+        assert_eq!(human_delta(0), "0 B");
+        assert_eq!(human_delta(1536), "+1.5 KB");
+        assert_eq!(human_delta(-2 * 1024 * 1024 * 1024), "-2.0 GB");
+        assert_eq!(human_delta(i64::MIN), "-8,192.0 PB");
+        assert_eq!(Json::from(-5i64).to_json_string(), "-5");
+        assert_eq!(Json::from(5i64).to_json_string(), "5");
     }
 
     #[test]

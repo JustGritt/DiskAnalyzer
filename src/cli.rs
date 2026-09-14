@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 
+use crate::compare::{compare, resolve_baseline_dir, same_dir, Baseline};
 use crate::exclusions;
 use crate::insights::{build_report, ReportOptions};
 use crate::platform;
-use crate::reports::csv::{write_error_csv, write_folder_csv, FileListWriter};
+use crate::reports::csv::{write_changes_csv, write_error_csv, write_folder_csv, FileListWriter};
 use crate::reports::html::write_html_payload;
 use crate::reports::json::write_json;
 use crate::reports::payload::build_payload;
@@ -99,7 +100,7 @@ pub struct Args {
     /// size floor for the CSV file listing; 0 lists every file
     #[arg(long, default_value = "10MB", value_name = "SIZE", value_parser = size_arg, help_heading = "Output")]
     pub csv_min_size: u64,
-    /// size floor for the CSV folder listing; 0 lists every folder
+    /// size floor for the CSV folder listing and --compare; 0 lists every folder
     #[arg(long, default_value = "1MB", value_name = "SIZE", value_parser = size_arg, help_heading = "Output")]
     pub folder_min_size: u64,
     /// skip the HTML report
@@ -117,6 +118,11 @@ pub struct Args {
     /// suppress progress output
     #[arg(long, help_heading = "Output")]
     pub quiet: bool,
+
+    /// report directory of an earlier scan to compare against, or `last` for
+    /// the newest one in ./reports
+    #[arg(long, value_name = "DIR", help_heading = "Compare")]
+    pub compare: Option<String>,
 
     /// worker threads (default: twice the CPU count, at most 16)
     #[arg(long, value_name = "N", help_heading = "Performance")]
@@ -285,6 +291,42 @@ pub fn run_with(args: Args) -> i32 {
     let want_html = !args.no_html;
     let want_json = !args.no_json;
     let out_dir = args.out.clone().unwrap_or_else(default_output_dir);
+
+    // The baseline is read before anything is created, so a bad --compare
+    // fails fast and never leaves an empty report directory behind.
+    let baseline = match &args.compare {
+        None => None,
+        Some(arg) => {
+            let dir = match resolve_baseline_dir(arg, &out_dir) {
+                Ok(dir) => dir,
+                Err(err) => {
+                    eprintln!("Cannot compare: {err}");
+                    return 2;
+                }
+            };
+            if same_dir(&dir, &out_dir) {
+                eprintln!(
+                    "Cannot compare: --compare and --out are the same directory ({}); \
+                     the new reports would overwrite the baseline. Choose another --out.",
+                    dir.display()
+                );
+                return 2;
+            }
+            match Baseline::load(&dir) {
+                Ok(base) => {
+                    if !args.quiet {
+                        eprintln!("Comparing with {} ({})", dir.display(), base.label);
+                    }
+                    Some(base)
+                }
+                Err(err) => {
+                    eprintln!("Cannot compare: {err}");
+                    return 2;
+                }
+            }
+        }
+    };
+
     let output = if want_files || want_html || want_json {
         match OutputDir::create(&out_dir) {
             Ok(output) => Some(output),
@@ -381,7 +423,11 @@ pub fn run_with(args: Args) -> i32 {
         folder_min_size: args.folder_min_size,
         stale_days: args.stale_days,
     };
-    let report = build_report(&mut result, &options);
+    let mut report = build_report(&mut result, &options);
+    report.comparison = baseline
+        .as_ref()
+        .map(|base| compare(&result, base, args.top, args.folder_min_size));
+    drop(baseline);
 
     let color = !args.no_color && terminal::supports_color();
     let text = terminal::render(&report, &result, color, terminal::terminal_width());
@@ -403,6 +449,12 @@ pub fn run_with(args: Args) -> i32 {
                 match write_error_csv(&result, output) {
                     Ok(_) => written.push(("unreadable.csv", output.join("unreadable.csv"))),
                     Err(err) => eprintln!("Warning: unreadable.csv was not written: {err}"),
+                }
+            }
+            if let Some(comparison) = &report.comparison {
+                match write_changes_csv(comparison, output) {
+                    Ok(_) => written.push(("changes.csv", output.join("changes.csv"))),
+                    Err(err) => eprintln!("Warning: changes.csv was not written: {err}"),
                 }
             }
         }

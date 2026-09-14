@@ -484,3 +484,111 @@ fn binary_runs_end_to_end() {
     assert_eq!(verify.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&verify.stdout).contains("Read-only guarantee"));
 }
+
+#[test]
+fn compare_reports_what_changed_since_an_earlier_run() {
+    let fixture = build_fixture();
+    let out = temp_dir();
+    let exe = env!("CARGO_BIN_EXE_diskanalyzer");
+    let run = |args: &[&std::ffi::OsStr]| {
+        Command::new(exe)
+            .args(["--no-color", "--quiet", "--threads", "2"])
+            .args(["--folder-min-size", "0", "--exclude-name", "skipme"])
+            .args(args)
+            .arg(&fixture.root)
+            .output()
+            .unwrap()
+    };
+    let (a, b, c) = (
+        out.path().join("A"),
+        out.path().join("B"),
+        out.path().join("C"),
+    );
+    let sep = std::path::MAIN_SEPARATOR;
+    // Only the CHANGED SINCE section counts: LARGEST FOLDERS lists b and a too.
+    let lists_path_ending = |stdout: &str, tail: &str| {
+        stdout
+            .split("\n-- ")
+            .filter(|section| section.starts_with("CHANGED SINCE"))
+            .flat_map(str::lines)
+            .any(|line| line.trim_end().ends_with(&format!("root{sep}{tail}")))
+    };
+
+    let first = run(&["--out".as_ref(), a.as_os_str()]);
+    assert_eq!(first.status.code(), Some(0));
+
+    // 50 KB more in b/: visible because the baseline listed every folder.
+    write(&fixture.root.join("b").join("new.bin"), &[1u8; 50_000]);
+    let second = run(&[
+        "--compare".as_ref(),
+        a.as_os_str(),
+        "--out".as_ref(),
+        b.as_os_str(),
+    ]);
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(stdout.contains("-- CHANGED SINCE"), "{stdout}");
+    assert!(lists_path_ending(&stdout, "b"), "{stdout}");
+    assert!(!stdout.contains("no report.json"), "{stdout}");
+    let changes = fs::read_to_string(b.join("changes.csv")).unwrap();
+    assert!(changes
+        .starts_with("\u{feff}delta_bytes,delta,before_bytes,after_bytes,status,full_path\r\n"));
+    let b_path = fixture.root.join("b").display().to_string();
+    assert!(
+        changes.contains(&format!("50000,+48.8 KB,20005,70005,grew,{b_path}\r\n")),
+        "{changes}"
+    );
+    let json = Json::parse(&fs::read_to_string(b.join("report.json")).unwrap()).unwrap();
+    let grew = json
+        .get("compare")
+        .and_then(|c| c.get("grew"))
+        .and_then(Json::as_array)
+        .unwrap();
+    assert_eq!(grew.len(), 1, "the chain up to the root collapses into b");
+
+    // Writing the new reports over the baseline is refused before scanning.
+    let clash = run(&[
+        "--compare".as_ref(),
+        a.as_os_str(),
+        "--out".as_ref(),
+        a.as_os_str(),
+    ]);
+    assert_eq!(clash.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&clash.stderr).contains("same directory"));
+
+    // A baseline that does not exist fails fast and creates nothing.
+    let nowhere = out.path().join("nowhere");
+    let d = out.path().join("D");
+    let missing = run(&[
+        "--compare".as_ref(),
+        nowhere.as_os_str(),
+        "--out".as_ref(),
+        d.as_os_str(),
+    ]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(!d.exists());
+
+    // Without report.json the floor is assumed to be the 1 MB default: the
+    // 50 KB is no longer listed, a 1.2 MB change is, and the gap is noted.
+    fs::remove_file(a.join("report.json")).unwrap();
+    write(
+        &fixture.root.join("a").join("big.bin"),
+        &vec![2u8; 1_200_000],
+    );
+    let third = run(&[
+        "--compare".as_ref(),
+        a.as_os_str(),
+        "--out".as_ref(),
+        c.as_os_str(),
+    ]);
+    let stdout = String::from_utf8_lossy(&third.stdout);
+    assert_eq!(third.status.code(), Some(0));
+    assert!(stdout.contains("baseline has no report.json"), "{stdout}");
+    assert!(lists_path_ending(&stdout, "a"), "{stdout}");
+    assert!(!lists_path_ending(&stdout, "b"), "{stdout}");
+}

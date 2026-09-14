@@ -6,6 +6,7 @@
 
 use super::csv::timestamp;
 use crate::categories::{CatId, ALL};
+use crate::compare::{Change, Comparison};
 use crate::exclusions;
 use crate::insights::{build_tree, Report, RECLAIM_MIN_SIZE};
 use crate::platform;
@@ -103,6 +104,48 @@ fn config_block(report: &Report, result: &ScanResult) -> Json {
         .set("top", options.top_n)
         .set("files", options.file_n)
         .set("staleDays", options.stale_days)
+}
+
+fn change_rows(changes: &[Change]) -> Vec<Json> {
+    changes
+        .iter()
+        .map(|change| {
+            Json::obj()
+                .set("path", change.path.as_str())
+                .set("before", change.before)
+                .set("after", change.after)
+                .set("delta", change.delta)
+                .set("status", change.status.key())
+        })
+        .collect()
+}
+
+fn comparison_block(comparison: &Comparison) -> Json {
+    let volumes: Vec<Json> = comparison
+        .volumes
+        .iter()
+        .map(|(root, used_before, used_after, free_before, free_after)| {
+            Json::obj()
+                .set("root", root.as_str())
+                .set("usedBefore", *used_before)
+                .set("usedAfter", *used_after)
+                .set("freeBefore", *free_before)
+                .set("freeAfter", *free_after)
+        })
+        .collect();
+    Json::obj()
+        .set("base", comparison.base_label.as_str())
+        .set("baseDir", comparison.base_dir.as_str())
+        .set("baseEpoch", comparison.base_epoch)
+        .set("beforeTotal", comparison.before_total)
+        .set("afterTotal", comparison.after_total)
+        .set("minChange", comparison.min_change)
+        .set("volumes", volumes)
+        .set("grew", change_rows(&comparison.grew))
+        .set("shrank", change_rows(&comparison.shrank))
+        .set("removed", change_rows(&comparison.removed))
+        .set("changedFolders", comparison.all.len())
+        .set("warnings", strings(&comparison.warnings))
 }
 
 fn reclaim_folder_rows(report: &Report, result: &ScanResult) -> Vec<Json> {
@@ -286,6 +329,7 @@ pub fn build_payload(report: &Report, result: &ScanResult) -> Json {
         .set("generatedEpoch", result.started_at)
         .set("config", config_block(report, result))
         .set("scan", scan)
+        .set("compare", report.comparison.as_ref().map(comparison_block))
         .set("volumes", volumes)
         .set("tree", build_tree(result, TREE_MIN_SIZE, TREE_MAX_NODES))
         .set("reclaim", reclaim)

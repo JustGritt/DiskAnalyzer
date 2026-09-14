@@ -29,8 +29,8 @@ most loose files directly inside them, largest and oldest files, and what was
 skipped and why. One self-contained file: no network, no companion assets.
 Open it, move it, mail it to yourself; it still works.
 
-**CSV listings** (`files.csv`, `folders.csv`) for the questions the reports do
-not answer. Sort every file you own by size, filter to one extension, hand the
+**CSV listings** (`files.csv`, `folders.csv`, and `changes.csv` with
+`--compare`) for the questions the reports do not answer. Sort every file you own by size, filter to one extension, hand the
 list to another tool.
 
 **`report.json`**, the same data the HTML report shows, for scripts and for
@@ -47,6 +47,7 @@ Reports land in `reports/scan-<timestamp>/` unless you pass `--out`.
 
 ```
 diskanalyzer                          scan the system volume, skipping the live OS
+diskanalyzer --compare last           ...and say what changed since the previous scan
 diskanalyzer --duplicates             also find duplicate files
 diskanalyzer ~/Projects /Volumes/Ext  scan specific folders or drives
 diskanalyzer --csv-min-size 0         list every file, not just large ones
@@ -91,10 +92,16 @@ skipping nothing, is noted on stderr so a typo does not go unnoticed.
 | --- | --- |
 | `--out DIR` | report directory |
 | `--csv-min-size SIZE` | size floor for `files.csv`; `0` lists every file (default 10MB) |
-| `--folder-min-size SIZE` | size floor for `folders.csv`; `0` lists every folder (default 1MB) |
+| `--folder-min-size SIZE` | size floor for `folders.csv` and for changes reported by `--compare`; `0` lists every folder (default 1MB) |
 | `--no-html`, `--no-csv`, `--no-json` | skip an output format |
 | `--no-color`, `--quiet` | plain text; no progress line |
 | `--threads N` | worker threads (default: twice the CPU count, at most 16) |
+
+### Compare
+
+| Option | Effect |
+| --- | --- |
+| `--compare DIR` | report what changed since the scan in `DIR`; `last` picks the newest `./reports/scan-*` with a `folders.csv` |
 
 Sizes accept `500MB`, `2GB`, `1.5g` or a plain byte count.
 
@@ -217,6 +224,54 @@ treemap can be colored by last modification instead of by category.
 
 ---
 
+## Comparing scans
+
+"The drive was fine last month" is a question about change, so a scan can be
+compared with an earlier one:
+
+```
+diskanalyzer --compare reports/scan-20260814-075803
+diskanalyzer --compare last
+```
+
+The terminal and HTML reports gain a section right after the scan summary:
+
+```
+-- CHANGED SINCE 2026-08-14 07:58 ----------------------------------------------
+ Scanned  386.4 GB -> 384.0 GB  (-2.4 GB)      Free  30.1 GB -> 15.4 GB
+ Grew
+      +5.2 GB     48.5 GB -> 53.7 GB      .../Projects/editor/target/debug
+      +1.1 GB         new -> 1.1 GB       .../Projects/site/node_modules
+ Shrank
+      -2.0 GB      2.0 GB -> removed      /private/tmp/something
+```
+
+- **Collapsed like the largest-folders list.** When a folder grew because one
+  child grew, only the child is listed, so the same gigabytes do not repeat at
+  every level up to the root.
+- **The baseline** is read from the earlier report directory: `folders.csv`
+  for the sizes, and `report.json` (when present) for its roots, sizing and
+  folder floor. Reports from before `report.json` existed still work; the
+  comparison says it cannot confirm the two scans measured the same way.
+- **Floors.** `folders.csv` only lists folders above `--folder-min-size`, so
+  a folder missing from the baseline may have been absent or just small; it
+  shows as `new`. Changes smaller than this run's `--folder-min-size`, or the
+  baseline's own floor if larger, are not listed. A baseline without
+  `report.json` is assumed to have used the 1 MB default.
+- **Removed** folders are listed at the top-most level that disappeared.
+  One that this scan skipped (an `--exclude`, for instance) is marked
+  `excluded`, and one that could not be read this time `unreadable`, rather
+  than reported as gone or shrunk.
+- A warning is shown when the roots differ (only what both scans cover is
+  compared) or when one scan used `--allocated` and the other did not.
+
+`changes.csv` lists every folder that changed by at least the floor, without
+collapsing: `delta_bytes`, `delta`, `before_bytes`, `after_bytes`, `status`,
+`full_path`. The baseline is read before anything is written, and `--out`
+may not be the baseline directory itself.
+
+---
+
 ## Duplicate detection
 
 `--duplicates` groups files by exact size, then compares the first and last
@@ -267,6 +322,7 @@ src/
   exclusions.rs       what is skipped, and why
   categories.rs       classification rules
   projects.rs         project markers (Cargo.toml, .git, ...)
+  compare.rs          --compare: reading a baseline and diffing against it
   insights.rs         rankings, reclaimable folders, duplicates, treemap pruning
   platform/           Windows, macOS and Linux specifics
   reports/

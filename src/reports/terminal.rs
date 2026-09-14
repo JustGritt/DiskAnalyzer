@@ -9,13 +9,15 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 
 use crate::categories::Confidence;
+use crate::compare::{Change, ChangeStatus};
 use crate::exclusions;
 use crate::insights::{Report, RECLAIM_MIN_SIZE};
 use crate::platform;
 use crate::projects;
 use crate::scanner::ScanResult;
 use crate::util::{
-    human_age, human_count, human_days, human_duration, human_size, truncate_middle, truncate_start,
+    human_age, human_count, human_days, human_delta, human_duration, human_size, truncate_middle,
+    truncate_start,
 };
 
 /// ANSI colors, or transparent no-ops when the terminal cannot show them.
@@ -128,6 +130,7 @@ impl TerminalReport<'_> {
         self.render_header();
         self.render_volumes();
         self.render_scan_summary();
+        self.render_comparison();
         self.render_roots();
         self.render_top_folders();
         self.render_categories();
@@ -253,6 +256,93 @@ impl TerminalReport<'_> {
             );
             self.line(&text);
         }
+    }
+
+    fn render_comparison(&mut self) {
+        let Some(comparison) = &self.report.comparison else {
+            return;
+        };
+        self.heading(&format!("CHANGED SINCE {}", comparison.base_label));
+        for warning in &comparison.warnings {
+            self.note(warning);
+        }
+        let mut totals = format!(
+            " Scanned  {} -> {}  ({})",
+            human_size(comparison.before_total),
+            human_size(comparison.after_total),
+            human_delta(comparison.after_total as i64 - comparison.before_total as i64)
+        );
+        let free =
+            |before: u64, after: u64| format!("{} -> {}", human_size(before), human_size(after));
+        match comparison.volumes.as_slice() {
+            [] => self.line(&totals),
+            [(_, _, _, free_before, free_after)] => {
+                let _ = write!(totals, "      Free  {}", free(*free_before, *free_after));
+                self.line(&totals);
+            }
+            volumes => {
+                self.line(&totals);
+                for (label, _, _, free_before, free_after) in volumes {
+                    self.line(&format!(
+                        " Free     {label}  {}",
+                        free(*free_before, *free_after)
+                    ));
+                }
+            }
+        }
+
+        let mut shrank: Vec<&Change> = comparison
+            .shrank
+            .iter()
+            .chain(&comparison.removed)
+            .collect();
+        shrank.sort_by(|a, b| a.delta.cmp(&b.delta).then_with(|| a.path.cmp(&b.path)));
+        shrank.truncate(self.report.options.top_n);
+        if comparison.grew.is_empty() && shrank.is_empty() {
+            self.note(&format!(
+                "no folder changed by {} or more",
+                human_size(comparison.min_change)
+            ));
+            return;
+        }
+        // delta, before, arrow, after: 3 + 11 + 2 + 10 + 4 + 10 + 2. A signed
+        // "+1,011.6 MB" is 11 wide.
+        let path_width = self.width.saturating_sub(42).max(30);
+        if !comparison.grew.is_empty() {
+            self.line(" Grew");
+            for change in &comparison.grew {
+                self.change_line(change, path_width);
+            }
+        }
+        if !shrank.is_empty() {
+            self.line(" Shrank");
+            for change in shrank {
+                self.change_line(change, path_width);
+            }
+        }
+        self.note(&format!(
+            "folders collapsed to where the change happened; changes under {} not listed",
+            human_size(comparison.min_change)
+        ));
+    }
+
+    fn change_line(&mut self, change: &Change, path_width: usize) {
+        let style = if change.delta > 0 { "yellow" } else { "green" };
+        let delta = self
+            .c
+            .paint(&format!("{:>11}", human_delta(change.delta)), &[style]);
+        let before = change.before.map_or_else(|| "new".to_string(), human_size);
+        let after = match (change.after, change.status) {
+            (Some(_), ChangeStatus::NowUnreadable) => "unreadable".to_string(),
+            (Some(after), _) => human_size(after),
+            (None, ChangeStatus::NowExcluded) => "excluded".to_string(),
+            (None, _) => "removed".to_string(),
+        };
+        let text = format!(
+            "   {delta}  {before:>10} -> {after:<10}  {}",
+            truncate_start(&change.path, path_width)
+        );
+        self.line(&text);
     }
 
     fn render_roots(&mut self) {
