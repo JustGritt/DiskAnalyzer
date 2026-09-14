@@ -10,11 +10,12 @@ use std::io::IsTerminal;
 
 use crate::categories::Confidence;
 use crate::exclusions;
-use crate::insights::Report;
+use crate::insights::{Report, RECLAIM_MIN_SIZE};
 use crate::platform;
+use crate::projects;
 use crate::scanner::ScanResult;
 use crate::util::{
-    human_age, human_count, human_days, human_duration, human_size, truncate_middle,
+    human_age, human_count, human_days, human_duration, human_size, truncate_middle, truncate_start,
 };
 
 /// ANSI colors, or transparent no-ops when the terminal cannot show them.
@@ -130,6 +131,7 @@ impl TerminalReport<'_> {
         self.render_roots();
         self.render_top_folders();
         self.render_categories();
+        self.render_reclaim_folders();
         self.render_top_files();
         self.render_old_files();
         self.render_extensions();
@@ -375,6 +377,102 @@ impl TerminalReport<'_> {
         }
         self.blank();
         self.note("DiskAnalyzer never deletes. These are places to look, not instructions.");
+    }
+
+    fn render_reclaim_folders(&mut self) {
+        let found = &self.report.reclaim_folders;
+        if found.folders.is_empty() {
+            return;
+        }
+        let result = self.result;
+        self.heading("RECLAIMABLE FOLDERS");
+        self.note("top-most regenerable or review folders. idle = time since the project around");
+        self.note("the folder last changed, not counting the folder itself; with no project, its own files");
+        self.blank();
+
+        let key_width = found
+            .folders
+            .iter()
+            .map(|folder| folder.category.key().len())
+            .max()
+            .unwrap_or(0);
+        let project_names: Vec<String> = found
+            .folders
+            .iter()
+            .map(|folder| match folder.project {
+                Some(id) => {
+                    let node = &result.nodes[id as usize];
+                    let name = match projects::primary_kind(node.markers) {
+                        Some(kind) => format!("{} ({kind})", node.name),
+                        None => node.name.to_string(),
+                    };
+                    truncate_middle(&name, 30)
+                }
+                None => "-".to_string(),
+            })
+            .collect();
+        let project_width = project_names
+            .iter()
+            .map(|name| name.chars().count())
+            .max()
+            .unwrap_or(1);
+        let idle_texts: Vec<String> = found
+            .folders
+            .iter()
+            .map(|folder| format!("idle {}", human_age(folder.activity, result.now)))
+            .collect();
+        let idle_width = idle_texts.iter().map(String::len).max().unwrap_or(0);
+        let path_width = self
+            .width
+            .saturating_sub(13 + key_width + 2 + idle_width + 2 + project_width + 2)
+            .max(30);
+        for ((folder, project), idle) in found.folders.iter().zip(&project_names).zip(&idle_texts) {
+            // Pad before coloring, as elsewhere: escape codes count toward widths.
+            let category = self.c.paint(
+                &format!("{:<key_width$}", folder.category.key()),
+                &[confidence_style(folder.category.confidence())],
+            );
+            let idle = format!("{idle:<idle_width$}");
+            let idle = if folder.stale {
+                self.c.paint(&idle, &["yellow"])
+            } else {
+                idle
+            };
+            // The end of the path names the project and the folder; keep it.
+            let text = format!(
+                " {:>11}  {}  {}  {:<project_width$}  {}",
+                human_size(folder.size),
+                category,
+                idle,
+                project,
+                truncate_start(&result.node_path(folder.id), path_width)
+            );
+            self.line(&text);
+        }
+
+        self.blank();
+        let mut summary = format!(
+            "{} folder{} over {}, {} in all",
+            human_count(found.count as u64),
+            if found.count == 1 { "" } else { "s" },
+            human_size(RECLAIM_MIN_SIZE),
+            human_size(found.total)
+        );
+        if found.count > found.folders.len() {
+            let _ = write!(summary, " (largest {} shown)", found.folders.len());
+        }
+        if found.stale > 0 {
+            let _ = write!(
+                summary,
+                "; {} idle for {} or more",
+                human_size(found.stale),
+                human_days(self.report.options.stale_days)
+            );
+        }
+        self.note(&summary);
+        self.note(
+            "Single files such as disc images are not folders; see LARGEST FILES and files.csv.",
+        );
     }
 
     fn render_top_files(&mut self) {

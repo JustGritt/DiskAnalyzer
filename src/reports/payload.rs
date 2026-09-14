@@ -7,8 +7,9 @@
 use super::csv::timestamp;
 use crate::categories::{CatId, ALL};
 use crate::exclusions;
-use crate::insights::{build_tree, Report};
+use crate::insights::{build_tree, Report, RECLAIM_MIN_SIZE};
 use crate::platform;
+use crate::projects;
 use crate::scanner::{FileRec, ScanResult};
 use crate::util::Json;
 
@@ -101,6 +102,34 @@ fn config_block(report: &Report, result: &ScanResult) -> Json {
         .set("dupMinSize", config.duplicate_min_size)
         .set("top", options.top_n)
         .set("files", options.file_n)
+        .set("staleDays", options.stale_days)
+}
+
+fn reclaim_folder_rows(report: &Report, result: &ScanResult) -> Vec<Json> {
+    report
+        .reclaim_folders
+        .folders
+        .iter()
+        .map(|folder| {
+            let project = folder.project.map(|id| &result.nodes[id as usize]);
+            Json::obj()
+                .set("path", result.node_path(folder.id))
+                .set("size", folder.size)
+                .set("files", folder.files)
+                .set("cat", folder.category.key())
+                .set("project", project.map(|node| node.name.to_string()))
+                .set("projectPath", folder.project.map(|id| result.node_path(id)))
+                .set(
+                    "projectKinds",
+                    strings(
+                        &project.map_or(Vec::new(), |node| projects::kind_labels(node.markers)),
+                    ),
+                )
+                .set("activity", folder.activity)
+                .set("newest", folder.contents_newest)
+                .set("stale", folder.stale)
+        })
+        .collect()
 }
 
 pub fn build_payload(report: &Report, result: &ScanResult) -> Json {
@@ -112,6 +141,7 @@ pub fn build_payload(report: &Report, result: &ScanResult) -> Json {
         .set("size", result.total_size)
         .set("logical", result.logical_size)
         .set("elapsed", result.elapsed)
+        .set("now", result.now)
         .set(
             "roots",
             result
@@ -260,6 +290,11 @@ pub fn build_payload(report: &Report, result: &ScanResult) -> Json {
         .set("tree", build_tree(result, TREE_MIN_SIZE, TREE_MAX_NODES))
         .set("reclaim", reclaim)
         .set("categories", categories)
+        .set("reclaimFolders", reclaim_folder_rows(report, result))
+        .set("reclaimFoldersCount", report.reclaim_folders.count)
+        .set("reclaimFoldersTotal", report.reclaim_folders.total)
+        .set("reclaimFoldersStale", report.reclaim_folders.stale)
+        .set("reclaimFoldersMinSize", RECLAIM_MIN_SIZE)
         .set("folders", folders)
         .set("hotspots", hotspots)
         .set("files", file_rows(&report.top_files))

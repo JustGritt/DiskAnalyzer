@@ -27,7 +27,7 @@ const FILE_COLUMNS: [&str; 9] = [
     "full_path",
 ];
 
-const FOLDER_COLUMNS: [&str; 9] = [
+const FOLDER_COLUMNS: [&str; 10] = [
     "total_bytes",
     "total_size",
     "files_here_bytes",
@@ -36,6 +36,7 @@ const FOLDER_COLUMNS: [&str; 9] = [
     "subfolders",
     "depth",
     "category",
+    "newest_modified",
     "full_path",
 ];
 
@@ -184,6 +185,11 @@ pub fn write_folder_csv(result: &ScanResult, out: &OutputDir, min_size: u64) -> 
             node.total_dirs.to_string(),
             node.depth.to_string(),
             node.category.unwrap_or(CatId::Other).label().to_string(),
+            if node.newest > 0.0 {
+                timestamp(node.newest)
+            } else {
+                String::new()
+            },
             paths[id as usize].clone(),
         ])?;
         written += 1;

@@ -13,6 +13,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use crate::categories::{self, CatId, NUM_CATEGORIES};
 use crate::exclusions;
 use crate::platform;
+use crate::projects;
 
 use super::{age_bucket, Shared, AGE_BUCKETS, CANCELLED, TOP_FILES_LIMIT};
 
@@ -74,6 +75,10 @@ pub enum Event {
         category: Option<CatId>,
         own_size: u64,
         own_files: u32,
+        /// Newest mtime among the files counted here; 0 when there are none.
+        own_newest: f64,
+        /// `projects` marker bits of the entries directly inside.
+        markers: u16,
     },
     FileRow {
         path: String,
@@ -193,6 +198,8 @@ fn process_dir(
     let at_volume_root = platform::is_volume_root(&job.display);
     let mut own_size: u64 = 0;
     let mut own_files: u32 = 0;
+    let mut own_newest: f64 = 0.0;
+    let mut markers: u16 = 0;
 
     match retry_interrupted(|| std::fs::read_dir(&job.path)) {
         Err(err) => {
@@ -229,6 +236,9 @@ fn process_dir(
                     let _ = events.send(Event::Link(display.to_string()));
                     continue;
                 }
+
+                // Before any exclusion: a skipped `.git` still marks a project.
+                markers |= projects::marker_bits(&name, md.is_dir());
 
                 if md.is_dir() {
                     let display = display_cache
@@ -309,6 +319,7 @@ fn process_dir(
                 slot.1 += size;
 
                 let mtime = mtime_of(&md);
+                own_newest = own_newest.max(mtime);
                 let slot = &mut state.age_stats[age_bucket(mtime, shared.now)];
                 slot.0 += 1;
                 slot.1 += size;
@@ -390,6 +401,8 @@ fn process_dir(
         category: job.category,
         own_size,
         own_files,
+        own_newest,
+        markers,
     });
 }
 

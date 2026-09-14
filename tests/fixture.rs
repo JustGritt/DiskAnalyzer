@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use diskanalyzer::categories::CatId;
-use diskanalyzer::insights::{build_report, ReportOptions};
+use diskanalyzer::insights::{build_report, reclaim_folders, ReportOptions};
 use diskanalyzer::platform;
+use diskanalyzer::projects;
 use diskanalyzer::reports::csv::{write_folder_csv, FileListWriter};
 use diskanalyzer::reports::html;
 use diskanalyzer::reports::sink::OutputDir;
@@ -308,6 +309,84 @@ fn reports_render_and_csvs_stream() {
     assert!(!page.contains("__PAYLOAD__"));
     html::write_html(&report, &result, &output).unwrap();
     assert!(output.join("report.html").is_file());
+}
+
+/// Set a file's modification time. Test-only: the crate itself can never
+/// do this.
+fn backdate(path: &Path, days: f64) {
+    let when =
+        std::time::SystemTime::now() - std::time::Duration::from_secs_f64(days * SECONDS_PER_DAY);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+#[test]
+fn reclaimable_folders_are_judged_by_their_project() {
+    let dir = temp_dir();
+    let root = dir.path().join("work");
+    let proj = root.join("proj");
+    fs::create_dir_all(proj.join("src")).unwrap();
+    fs::create_dir_all(proj.join("target").join("debug")).unwrap();
+    write(&proj.join("Cargo.toml"), b"[package]\n");
+    write(&proj.join("src").join("main.rs"), b"fn main() {}\n");
+    write(
+        &proj.join("target").join("debug").join("big.bin"),
+        &[7u8; 4096],
+    );
+    backdate(&proj.join("Cargo.toml"), 200.0);
+    backdate(&proj.join("src").join("main.rs"), 200.0);
+
+    let config = ScanConfig {
+        roots: vec![root.clone()],
+        threads: 2,
+        ..ScanConfig::default()
+    };
+    let result = scan(&config, None, 0, None);
+    let found = reclaim_folders(&result, 10, 90, 0, None);
+    assert_eq!(found.folders.len(), 1, "{found:?}");
+    let folder = &found.folders[0];
+    assert_eq!(folder.category, CatId::DevBuild);
+    assert!(result.node_path(folder.id).ends_with("target"));
+    let project = folder.project.expect("proj is recognized by Cargo.toml");
+    assert_eq!(&*result.nodes[project as usize].name, "proj");
+    assert!(result.nodes[project as usize].markers & projects::RUST != 0);
+    assert!(folder.stale, "source untouched for 200 days");
+    assert!(
+        result.now - folder.contents_newest < SECONDS_PER_DAY,
+        "build output is fresh"
+    );
+
+    // A 200-day-old project is not idle under a 365-day threshold.
+    assert!(!reclaim_folders(&result, 10, 365, 0, None).folders[0].stale);
+
+    // Both reports show it. The real floor is 64 MB, so substitute the list
+    // found without one.
+    let mut result = result;
+    let mut report = build_report(&mut result, &ReportOptions::default());
+    report.reclaim_folders = found;
+    let text = terminal::render(&report, &result, false, 120);
+    assert!(text.contains("-- RECLAIMABLE FOLDERS"), "{text}");
+    assert!(text.contains("proj (rust)"), "{text}");
+    assert!(text.contains("idle for 90 days or more"), "{text}");
+    let page = html::render(&report, &result);
+    assert!(page.contains(r#""project":"proj","#));
+    assert!(page.contains(r#""projectKinds":["rust"]"#));
+    assert!(page.contains(r#""stale":true"#));
+
+    // folders.csv carries the newest mtime per folder.
+    let out_dir = temp_dir();
+    let output = OutputDir::create(out_dir.path()).unwrap();
+    write_folder_csv(&result, &output, 0).unwrap();
+    let csv = fs::read_to_string(output.join("folders.csv")).unwrap();
+    assert!(csv
+        .lines()
+        .next()
+        .unwrap()
+        .ends_with(",newest_modified,full_path"));
 }
 
 #[test]

@@ -9,6 +9,7 @@ pub mod cli;
 pub mod exclusions;
 pub mod insights;
 pub mod platform;
+pub mod projects;
 pub mod reports;
 pub mod scanner;
 pub mod util;

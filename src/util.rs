@@ -112,6 +112,18 @@ pub fn truncate_middle(text: &str, width: usize) -> String {
     out
 }
 
+/// Shorten a path from the front, for columns where the last components
+/// carry the meaning (`.../project/target`).
+pub fn truncate_start(text: &str, width: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if width <= 3 || chars.len() <= width {
+        return text.to_string();
+    }
+    let mut out = String::from("...");
+    out.extend(chars[chars.len() - (width - 3)..].iter());
+    out
+}
+
 /// Approximate on-disk size: every file occupies whole clusters.
 pub fn round_to_cluster(size: u64, cluster: u64) -> u64 {
     if cluster <= 1 || size == 0 {
@@ -646,6 +658,12 @@ mod tests {
         assert_eq!(truncate_middle("abcdefghij", 3), "abcdefghij");
         assert_eq!(truncate_middle("abcdefghijklmnop", 10), "abc...mnop");
         assert_eq!(truncate_middle("ééééééééééé", 8), "éé...ééé");
+        assert_eq!(truncate_start("short", 10), "short");
+        assert_eq!(
+            truncate_start("/a/b/project/target", 17),
+            "...project/target"
+        );
+        assert_eq!(truncate_start("éééééé", 5), "...éé");
     }
 
     #[test]

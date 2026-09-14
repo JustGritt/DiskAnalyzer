@@ -81,6 +81,7 @@ skipping nothing, is noted on stderr so a typo does not go unnoticed.
 | `--files N` | files per ranking (default 30) |
 | `--old-min-size SIZE` | size floor for the untouched-files list (default 100MB) |
 | `--old-min-days DAYS` | age floor for the untouched-files list (default 365) |
+| `--stale-days DAYS` | a project unchanged this long counts as idle in the reclaimable-folders list (default 90) |
 | `--duplicates` | look for duplicate files |
 | `--dup-min-size SIZE` | ignore duplicates below this size (default 25MB) |
 
@@ -179,6 +180,43 @@ These labels say where looking is worthwhile. Nothing more.
 
 ---
 
+## Reclaimable folders
+
+Category totals say *how much* is regenerable; they do not say *which* build
+folders belong to projects you stopped working on. A 16 GB `node_modules` made
+of small files never appears among the largest files, so the report also
+ranks the top-most regenerable or review folders of 64 MB or more, each with
+the project it belongs to and how long that project has been idle:
+
+```
+ 48.5 GB  dev-build  idle 5mo     editor (rust)      /Users/me/Projects/editor/target
+ 25.8 GB  dev-cache  idle 2d      -                  /Library/Developer/CoreSimulator
+ 16.0 GB  dev-deps   idle 1y      old-site (node)    /Users/me/Projects/old-site/node_modules
+```
+
+- **Top-most only.** A `build/` inside `node_modules/` is part of that
+  `node_modules`, and each byte is counted once. Caches inside installed
+  applications or games are left out: they are the application's business.
+- **The project** is the nearest folder, up to four levels above, holding a
+  `.git` or a project file such as `Cargo.toml`, `package.json`,
+  `pyproject.toml`, `go.mod`, a Gradle or Maven build, `CMakeLists.txt`,
+  `Package.swift`, `pubspec.yaml`, `project.godot`, a `.sln` or `.csproj`, a
+  `.uproject`, a Unity `ProjectSettings` folder or an Xcode project. A `.git`
+  wins over a nearer project file, so a monorepo is judged as a whole. Your
+  home folder and volume roots never count as projects.
+- **Idle** is the time since the newest file in the project changed, *not
+  counting the reclaimable folders themselves*: builds rewrite their output
+  constantly and package stores may keep archive dates, so those dates say
+  nothing about whether the project is alive. When no project is found, the
+  folder's own newest file is used.
+- A folder counts as idle after `--stale-days` (default 90). Idle ages are
+  highlighted, and the HTML report can filter to idle projects only.
+
+`folders.csv` carries a `newest_modified` column for every folder, and the
+treemap can be colored by last modification instead of by category.
+
+---
+
 ## Duplicate detection
 
 `--duplicates` groups files by exact size, then compares the first and last
@@ -228,7 +266,8 @@ src/
     aggregate.rs      the single owner of the node arena and the streaming CSV
   exclusions.rs       what is skipped, and why
   categories.rs       classification rules
-  insights.rs         rankings, duplicates, treemap pruning
+  projects.rs         project markers (Cargo.toml, .git, ...)
+  insights.rs         rankings, reclaimable folders, duplicates, treemap pruning
   platform/           Windows, macOS and Linux specifics
   reports/
     terminal.rs       the terminal report

@@ -78,6 +78,14 @@ pub struct Args {
         help_heading = "Detail"
     )]
     pub old_min_days: u64,
+    /// a project unchanged this long counts as idle in the reclaimable-folders list
+    #[arg(
+        long,
+        default_value_t = 90,
+        value_name = "DAYS",
+        help_heading = "Detail"
+    )]
+    pub stale_days: u64,
     /// look for duplicate files (reads 128KB per candidate)
     #[arg(long, help_heading = "Detail")]
     pub duplicates: bool,
@@ -371,6 +379,7 @@ pub fn run_with(args: Args) -> i32 {
         with_duplicates: args.duplicates,
         csv_min_size: args.csv_min_size,
         folder_min_size: args.folder_min_size,
+        stale_days: args.stale_days,
     };
     let report = build_report(&mut result, &options);
 
@@ -463,6 +472,8 @@ mod tests {
         assert_eq!(args.dup_min_size, 25 * 1024 * 1024);
         assert_eq!(args.csv_min_size, 10 * 1024 * 1024);
         assert_eq!(args.folder_min_size, 1024 * 1024);
+        assert_eq!(args.stale_days, 90);
+        assert_eq!(args.stale_days, ReportOptions::default().stale_days);
         assert!(!args.duplicates);
         assert!(args.roots.is_empty());
     }
