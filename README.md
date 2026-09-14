@@ -30,8 +30,8 @@ skipped and why. One self-contained file: no network, no companion assets.
 Open it, move it, mail it to yourself; it still works.
 
 **CSV listings** (`files.csv`, `folders.csv`, and `changes.csv` with
-`--compare`) for the questions the reports do not answer. Sort every file you own by size, filter to one extension, hand the
-list to another tool.
+`--compare`) for the questions the reports do not answer. Sort every file you
+own by size, filter to one extension, hand the list to another tool.
 
 **`report.json`**, the same data the HTML report shows, for scripts and for
 keeping a history of scans. It also records the settings the scan ran with
@@ -61,10 +61,10 @@ diskanalyzer --help                   all options
 | `--include-os` | also scan the live OS folders that are skipped by default |
 | `--exclude PATH` | skip a folder (repeatable; relative paths resolve against the current directory) |
 | `--exclude-name NAME` | skip any folder with this name (repeatable) |
+| `--cross-filesystems` | descend into other mounted filesystems (Unix; off by default) |
 
 An `--exclude` that is not an existing folder, or an exclusion that ends up
 skipping nothing, is noted on stderr so a typo does not go unnoticed.
-| `--cross-filesystems` | descend into other mounted filesystems (Unix; off by default) |
 
 ### Sizing
 
