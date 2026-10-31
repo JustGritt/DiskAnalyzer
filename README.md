@@ -60,7 +60,7 @@ diskanalyzer --help                   all options
 | --- | --- |
 | `--allocated` | report on-disk size instead of logical size |
 | `--cluster-size BYTES` | cluster size for `--allocated` on Windows (default 4096) |
-| `--dedup-hardlinks` | count a file with several hard links once (Unix) |
+| `--dedup-hardlinks` | count a file with several hard links once (slower on Windows, see below) |
 
 ### Detail
 
@@ -189,8 +189,18 @@ the real block count on Unix (`st_blocks`), and rounds up to `--cluster-size` on
 Windows.
 
 **Hard links.** A file with several hard links is counted once per link by
-default, so a tree using them reads as larger than it is. `--dedup-hardlinks`
-counts each inode once on Unix.
+default, so a tree using them reads as larger than it is. Package managers
+that share one copy between a cache and your projects do exactly this: uv
+and pnpm hard-link packages from their cache into every environment, so the
+same bytes show up in both. `--dedup-hardlinks` counts each file once, by
+inode on Unix and by volume and file ID on Windows. The size goes to
+whichever link the scan reaches first, so which of two folders shows it can
+change between runs; the total does not.
+
+On Unix this costs nothing. On Windows a directory listing does not carry
+the link count, so each file is opened for its attributes only (no data
+access, nothing created, nothing followed): a warm scan of about two million
+files went from 4 to 27 seconds.
 
 **Unreadable paths.** Some folders need elevated rights; on macOS, most of your
 own Library needs Full Disk Access. They are counted, listed in

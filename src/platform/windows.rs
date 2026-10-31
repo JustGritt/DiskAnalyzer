@@ -2,15 +2,22 @@
 //! node_modules trees are not capped at MAX_PATH; reparse points (junctions,
 //! symlinks, mount points) are recorded and never followed.
 
-use std::fs::Metadata;
+use std::fs::{DirEntry, Metadata};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use windows_sys::Win32::Foundation::{BOOL, FILETIME, SYSTEMTIME};
-use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, BOOL, FILETIME, HANDLE, INVALID_HANDLE_VALUE, SYSTEMTIME,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FileIdInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
+};
 use windows_sys::Win32::System::Console::{
     GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleCtrlHandler,
     SetConsoleMode, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
@@ -118,12 +125,73 @@ pub fn device_of(_md: &Metadata) -> u64 {
     0
 }
 
-pub fn inode_of(_md: &Metadata) -> u64 {
-    0
+/// `(volume serial, file ID)` of a file with more than one hard link, so the
+/// scan can count it once; `None` for a file with a single link, or one whose
+/// attributes cannot be read (it is then counted, as without the option).
+///
+/// A directory listing's `Metadata` carries neither the link count nor the
+/// file ID on Windows, so the file is opened, read-only in the narrowest way
+/// the API allows: FILE_READ_ATTRIBUTES access and no data access (no
+/// antivirus scan on open, no last-access update), every share mode so no
+/// other program is blocked, OPEN_EXISTING so nothing can be created, and
+/// FILE_FLAG_OPEN_REPARSE_POINT so nothing is followed.
+pub fn hardlink_key(entry: &DirEntry, _md: &Metadata) -> Option<(u64, u128)> {
+    let handle = AttributeHandle::open(&entry.path())?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 || info.nNumberOfLinks <= 1 {
+        return None;
+    }
+    // Only NTFS guarantees the 64-bit index above is unique; ReFS (Dev
+    // Drives) needs the 128-bit ID. Asked for linked files only.
+    let mut id: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let has_id = unsafe {
+        GetFileInformationByHandleEx(
+            handle.0,
+            FileIdInfo,
+            (&mut id as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    } != 0;
+    Some(if has_id {
+        (
+            id.VolumeSerialNumber,
+            u128::from_le_bytes(id.FileId.Identifier),
+        )
+    } else {
+        (
+            u64::from(info.dwVolumeSerialNumber),
+            (u128::from(info.nFileIndexHigh) << 32) | u128::from(info.nFileIndexLow),
+        )
+    })
 }
 
-pub fn link_count(_md: &Metadata) -> u64 {
-    1
+/// A handle opened for reading attributes only, closed on drop.
+struct AttributeHandle(HANDLE);
+
+impl AttributeHandle {
+    fn open(path: &Path) -> Option<Self> {
+        let wide_path = wide(path);
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        (handle != INVALID_HANDLE_VALUE).then_some(Self(handle))
+    }
+}
+
+impl Drop for AttributeHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
 }
 
 pub fn extra_allowed_devices() -> Vec<u64> {

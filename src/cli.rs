@@ -53,7 +53,7 @@ pub struct Args {
     /// cluster size for --allocated on Windows (default: 4096)
     #[arg(long, value_name = "BYTES", help_heading = "Sizing")]
     pub cluster_size: Option<u64>,
-    /// count a file with several hard links once (Unix)
+    /// count a file with several hard links once
     #[arg(long, help_heading = "Sizing")]
     pub dedup_hardlinks: bool,
 
@@ -121,7 +121,7 @@ Read-only guarantee for this build
     the report files by name inside the directory chosen with --out.
   - The build forbids every std::fs write, remove and rename API outside that
     module (clippy.toml, disallowed-methods) and a test audits the source for
-    the same names. Both run in CI.
+    the same names and their Win32 equivalents. Both run in CI.
 
 Enforcement is at build time: a compiled binary cannot audit its own source.
 Nothing this program does can delete, move, rename or modify your files.";

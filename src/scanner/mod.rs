@@ -268,7 +268,8 @@ pub(crate) struct Shared<'a> {
     pub want_rows: bool,
     pub sink_min_size: u64,
     pub progress: Option<&'a ScanProgress>,
-    pub hardlinks: Mutex<HashSet<(u64, u64)>>,
+    /// `(device, file ID)` of every multiply-linked file counted so far.
+    pub hardlinks: Mutex<HashSet<(u64, u128)>>,
     pub now: f64,
     pub old_min_age: f64,
 }

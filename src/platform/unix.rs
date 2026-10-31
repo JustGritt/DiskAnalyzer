@@ -1,7 +1,7 @@
 //! macOS and Linux.
 
 use std::ffi::CString;
-use std::fs::Metadata;
+use std::fs::{DirEntry, Metadata};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -131,12 +131,11 @@ pub fn device_of(md: &Metadata) -> u64 {
     md.dev()
 }
 
-pub fn inode_of(md: &Metadata) -> u64 {
-    md.ino()
-}
-
-pub fn link_count(md: &Metadata) -> u64 {
-    md.nlink()
+/// `(device, inode)` of a file with more than one hard link, so the scan can
+/// count it once; `None` for a file with a single link. The lstat behind
+/// `md` already carries both, so the entry itself is not needed here.
+pub fn hardlink_key(_entry: &DirEntry, md: &Metadata) -> Option<(u64, u128)> {
+    (md.nlink() > 1).then(|| (md.dev(), u128::from(md.ino())))
 }
 
 /// Devices the walk may cross into besides each root's own. On macOS the

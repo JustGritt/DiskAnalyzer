@@ -208,6 +208,31 @@ fn parallel_scan_matches_serial_scan() {
 }
 
 #[test]
+fn dedup_hardlinks_counts_a_linked_file_once() {
+    let fixture = build_fixture();
+    // A second name for b/Archive.TAR.GZ (20 000 bytes) in another folder.
+    fs::create_dir_all(fixture.root.join("links")).unwrap();
+    fs::hard_link(
+        fixture.root.join("b/Archive.TAR.GZ"),
+        fixture.root.join("links/archive-again.tar.gz"),
+    )
+    .unwrap();
+    let mut config = config_for(&fixture, 4);
+
+    let counted = scan(&config, None, 0, None);
+    assert_eq!(counted.total_size, EXPECTED_SIZE + 20_000);
+    assert_eq!(counted.total_files, EXPECTED_FILES + 1);
+
+    config.dedup_hardlinks = true;
+    for threads in [1, 4] {
+        config.threads = threads;
+        let deduped = scan(&config, None, 0, None);
+        assert_eq!(deduped.total_size, EXPECTED_SIZE, "threads={threads}");
+        assert_eq!(deduped.total_files, EXPECTED_FILES, "threads={threads}");
+    }
+}
+
+#[test]
 fn duplicates_need_matching_content_not_just_size() {
     let fixture = build_fixture();
     let mut result = scan(&config_for(&fixture, 4), None, 0, None);

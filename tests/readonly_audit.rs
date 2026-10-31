@@ -23,6 +23,30 @@ const FORBIDDEN: &[&str] = &[
     "set_modified",
     "set_times",
     "set_len",
+    // Win32, for the calls that bypass std (the platform layer opens files
+    // for FILE_READ_ATTRIBUTES with OPEN_EXISTING): write access, any
+    // disposition that can create or truncate, and the mutating APIs.
+    "GENERIC_WRITE",
+    "GENERIC_ALL",
+    "FILE_WRITE_",
+    "FILE_APPEND_DATA",
+    "CREATE_ALWAYS",
+    "CREATE_NEW",
+    "OPEN_ALWAYS",
+    "TRUNCATE_EXISTING",
+    "WriteFile",
+    "DeleteFile",
+    "RemoveDirectory",
+    "MoveFile",
+    "CopyFile",
+    "ReplaceFile",
+    "SetFileInformationByHandle",
+    "SetFileAttributes",
+    "SetFileTime",
+    "SetEndOfFile",
+    "CreateDirectory",
+    "CreateHardLink",
+    "CreateSymbolicLink",
 ];
 
 const WRITER_MODULE: &str = "sink.rs";

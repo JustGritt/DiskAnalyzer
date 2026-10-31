@@ -251,15 +251,16 @@ fn process_dir(
                     let _ = events.send(Event::OsManaged(display.to_string(), logical));
                     continue;
                 }
-                if config.dedup_hardlinks && platform::link_count(&md) > 1 {
-                    let key = (platform::device_of(&md), platform::inode_of(&md));
-                    let first_seen = shared
-                        .hardlinks
-                        .lock()
-                        .map(|mut set| set.insert(key))
-                        .unwrap_or(true);
-                    if !first_seen {
-                        continue;
+                if config.dedup_hardlinks {
+                    if let Some(key) = platform::hardlink_key(&entry, &md) {
+                        let first_seen = shared
+                            .hardlinks
+                            .lock()
+                            .map(|mut set| set.insert(key))
+                            .unwrap_or(true);
+                        if !first_seen {
+                            continue;
+                        }
                     }
                 }
 
