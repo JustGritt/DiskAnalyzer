@@ -156,6 +156,16 @@ pub fn device_of(md: &Metadata) -> u64 {
 /// count it once; `None` for a file with a single link. The lstat behind
 /// `md` already carries both, so the entry itself is not needed here.
 pub fn hardlink_key(_entry: &DirEntry, md: &Metadata) -> Option<(u64, u128)> {
+    hardlink_key_in(md)
+}
+
+/// [`hardlink_key`] for a display path instead of a directory entry: an
+/// lstat, so a link is never followed.
+pub fn hardlink_key_of(display: &str) -> Option<(u64, u128)> {
+    hardlink_key_in(&Path::new(display).symlink_metadata().ok()?)
+}
+
+fn hardlink_key_in(md: &Metadata) -> Option<(u64, u128)> {
     (md.nlink() > 1).then(|| (md.dev(), u128::from(md.ino())))
 }
 

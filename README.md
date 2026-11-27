@@ -284,6 +284,10 @@ Matching size, head and tail is strong evidence of a duplicate but it is not
 proof, which is why the report says *likely* and why nothing acts on the
 finding. The search stops at a read budget and says so when it does.
 
+Hard links to the same file count as one copy: they share one set of bytes,
+so removing all but one of them frees nothing. A group is reported only when
+at least two separate files match.
+
 ---
 
 ## Accuracy notes

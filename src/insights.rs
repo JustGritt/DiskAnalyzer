@@ -377,6 +377,13 @@ pub fn find_duplicates(
         for (_, mut matched) in by_signature {
             if matched.len() > 1 {
                 matched.sort();
+                // Hard links to one file share its bytes: keep one name each.
+                let mut seen = std::collections::HashSet::new();
+                matched.retain(|path| {
+                    platform::hardlink_key_of(path).is_none_or(|key| seen.insert(key))
+                });
+            }
+            if matched.len() > 1 {
                 groups.push(DuplicateGroup {
                     size,
                     paths: matched,

@@ -136,7 +136,17 @@ pub fn device_of(_md: &Metadata) -> u64 {
 /// other program is blocked, OPEN_EXISTING so nothing can be created, and
 /// FILE_FLAG_OPEN_REPARSE_POINT so nothing is followed.
 pub fn hardlink_key(entry: &DirEntry, _md: &Metadata) -> Option<(u64, u128)> {
-    let handle = AttributeHandle::open(&entry.path())?;
+    hardlink_key_at(&entry.path())
+}
+
+/// [`hardlink_key`] for a display path instead of a directory entry.
+pub fn hardlink_key_of(display: &str) -> Option<(u64, u128)> {
+    // CreateFileW caps a path at MAX_PATH unless it carries the prefix.
+    hardlink_key_at(&to_scan_path(Path::new(display)))
+}
+
+fn hardlink_key_at(path: &Path) -> Option<(u64, u128)> {
+    let handle = AttributeHandle::open(path)?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 || info.nNumberOfLinks <= 1 {
         return None;

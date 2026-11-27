@@ -274,6 +274,29 @@ fn duplicates_need_matching_content_not_just_size() {
 }
 
 #[test]
+fn duplicates_count_hard_links_to_one_file_once() {
+    let fixture = build_fixture();
+    // A second name for one of the two copies, and one for a file that has
+    // no duplicate: neither link is another copy.
+    fs::hard_link(
+        fixture.root.join("dup1.bin"),
+        fixture.root.join("dup1-link.bin"),
+    )
+    .unwrap();
+    fs::hard_link(
+        fixture.root.join("same-size-different.bin"),
+        fixture.root.join("different-link.bin"),
+    )
+    .unwrap();
+    let mut result = scan(&config_for(&fixture, 4), None, 0, None);
+    let report = build_report(&mut result, &with_duplicates());
+    assert_eq!(report.duplicates.len(), 1, "{:?}", report.duplicates);
+    let group = &report.duplicates[0];
+    assert_eq!(group.paths.len(), 2, "{:?}", group.paths);
+    assert_eq!(group.wasted(), DUP_BYTES as u64);
+}
+
+#[test]
 fn reports_render_and_csvs_stream() {
     let fixture = build_fixture();
     let out_dir = temp_dir();
