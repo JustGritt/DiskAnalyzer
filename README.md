@@ -312,6 +312,15 @@ the link count, so each file is opened for its attributes only (no data
 access, nothing created, nothing followed): a warm scan of about two million
 files went from 4 to 27 seconds.
 
+**Cloud-only files.** OneDrive or Dropbox "online-only" files on Windows, and
+iCloud files that have not been downloaded on macOS, appear in a folder at
+their full size although their content is not on the disk. By default they
+count at that logical size, like every other file; with `--allocated` they
+count as zero on Windows and at their real block count on Unix. Reading one
+would make the sync client download it, so `--duplicates` never opens or
+lists them, and `--dedup-hardlinks`, which opens each file on Windows, passes
+over them. The scan summary says how many there are and their logical size.
+
 **Unreadable paths.** Some folders need elevated rights; on macOS, most of your
 own Library needs Full Disk Access. They are counted, listed in
 `unreadable.csv`, and reported as a count so the totals can be read honestly

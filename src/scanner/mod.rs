@@ -174,6 +174,9 @@ pub struct ScanResult {
     pub total_dirs: u64,
     pub total_size: u64,
     pub logical_size: u64,
+    /// (count, logical size) of cloud-only files, whose content is not on
+    /// this disk.
+    pub cloud_only: (u64, u64),
     /// extension -> (count, size)
     pub ext_stats: HashMap<Box<str>, (u64, u64)>,
     /// indexed by `CatId::index()` -> (count, size)
@@ -207,6 +210,7 @@ impl ScanResult {
             total_dirs: 0,
             total_size: 0,
             logical_size: 0,
+            cloud_only: (0, 0),
             ext_stats: HashMap::new(),
             cat_stats: [(0, 0); NUM_CATEGORIES],
             age_stats: [(0, 0); AGE_BUCKETS.len()],
@@ -419,6 +423,8 @@ pub fn scan(
     let mut top: Vec<FileRec> = Vec::new();
     for state in states {
         result.logical_size += state.logical_size;
+        result.cloud_only.0 += state.cloud_only.0;
+        result.cloud_only.1 += state.cloud_only.1;
         for (ext, (count, size)) in state.ext_stats {
             let slot = result.ext_stats.entry(ext).or_insert((0, 0));
             slot.0 += count;

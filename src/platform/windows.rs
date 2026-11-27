@@ -14,9 +14,10 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FileIdInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_OFFLINE,
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{
     GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleCtrlHandler,
@@ -117,7 +118,26 @@ pub fn is_link(md: &Metadata) -> bool {
     md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
+/// A placeholder whose content is held by a sync client (OneDrive or Dropbox
+/// "online-only"), so reading it would download it. The attributes come with
+/// the directory listing: nothing is opened to ask.
+pub fn is_cloud_only(md: &Metadata) -> bool {
+    has_cloud_only_attribute(md.file_attributes())
+}
+
+fn has_cloud_only_attribute(attributes: u32) -> bool {
+    const CLOUD_ONLY: u32 = FILE_ATTRIBUTE_OFFLINE
+        | FILE_ATTRIBUTE_RECALL_ON_OPEN
+        | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+    attributes & CLOUD_ONLY != 0
+}
+
+/// The logical size rounded up to whole clusters, except for a cloud-only
+/// file, which holds none.
 pub fn allocated_size(md: &Metadata, cluster: u64) -> u64 {
+    if is_cloud_only(md) {
+        return 0;
+    }
     round_to_cluster(md.len(), cluster)
 }
 
@@ -360,6 +380,18 @@ mod tests {
         // Two roots on one drive share a gauge, labelled by the drive.
         assert_eq!(key_a, key_b);
         assert_eq!(label, r"C:\");
+    }
+
+    #[test]
+    fn cloud_only_is_any_of_the_three_recall_attributes() {
+        // Offline, recall on open, recall on data access (here with archive).
+        assert!(has_cloud_only_attribute(0x1000));
+        assert!(has_cloud_only_attribute(0x0004_0000));
+        assert!(has_cloud_only_attribute(0x0040_0000 | 0x20));
+        // Archive, reparse point, and pinned ("always keep on this device").
+        assert!(!has_cloud_only_attribute(0x20 | 0x400 | 0x0008_0000));
+        // Unpinned alone: may be freed later, but the content is here now.
+        assert!(!has_cloud_only_attribute(0x0010_0000));
     }
 
     #[test]

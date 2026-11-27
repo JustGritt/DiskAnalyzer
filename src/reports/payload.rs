@@ -199,6 +199,8 @@ pub fn build_payload(report: &Report, result: &ScanResult) -> Json {
         .set("oldMinSize", result.config.old_file_min_size)
         .set("errors", result.errors.len())
         .set("links", result.links.len())
+        .set("cloudOnlyFiles", result.cloud_only.0)
+        .set("cloudOnlyBytes", result.cloud_only.1)
         .set("allocated", result.config.use_allocated)
         .set("includeOs", result.config.include_os)
         .set("osName", platform::OS_NAME)

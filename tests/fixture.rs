@@ -253,6 +253,42 @@ fn dedup_hardlinks_counts_a_linked_file_once() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn cloud_only_files_are_counted_but_never_read() {
+    let fixture = build_fixture();
+    let mut config = config_for(&fixture, 4);
+    config.use_allocated = true;
+    let on_disk = scan(&config, None, 0, None).total_size;
+
+    // The offline attribute is one of those a sync client sets on a file
+    // whose content it has not downloaded.
+    let marked = Command::new("attrib")
+        .arg("+O")
+        .arg(fixture.root.join("dup1.bin"))
+        .status()
+        .unwrap();
+    assert!(marked.success());
+
+    // 30 000 bytes round up to eight 4 KB clusters; a placeholder holds none.
+    let allocated = scan(&config, None, 0, None);
+    assert_eq!(on_disk - allocated.total_size, 32_768);
+    assert_eq!(allocated.total_files, EXPECTED_FILES);
+
+    config.use_allocated = false;
+    let mut result = scan(&config, None, 0, None);
+    assert_eq!(result.cloud_only, (1, DUP_BYTES as u64));
+    assert_eq!(result.total_size, EXPECTED_SIZE, "logical sizing unchanged");
+    // dup2.bin is left without a partner.
+    let report = build_report(&mut result, &with_duplicates());
+    assert!(report.duplicates.is_empty(), "{:?}", report.duplicates);
+
+    let text = terminal::render(&report, &result, false, 100);
+    assert!(text.contains("1 cloud-only files (29.3 KB)"), "{text}");
+    let page = html::render(&report, &result);
+    assert!(page.contains(r#""cloudOnlyFiles":1,"cloudOnlyBytes":30000"#));
+}
+
 #[test]
 fn duplicates_need_matching_content_not_just_size() {
     let fixture = build_fixture();

@@ -245,6 +245,13 @@ impl TerminalReport<'_> {
                 result.links.len()
             ));
         }
+        if result.cloud_only.0 > 0 {
+            self.line(&format!(
+                " Cloud    {} cloud-only files ({}) not stored on this disk; --duplicates does not read them",
+                human_count(result.cloud_only.0),
+                human_size(result.cloud_only.1)
+            ));
+        }
         if !result.errors.is_empty() {
             let text = self.c.paint(
                 &format!(

@@ -142,6 +142,19 @@ pub fn is_link(md: &Metadata) -> bool {
     md.file_type().is_symlink()
 }
 
+/// A "dataless" file: its content is held by iCloud or another file provider,
+/// so reading it would download it.
+#[cfg(target_os = "macos")]
+pub fn is_cloud_only(md: &Metadata) -> bool {
+    const SF_DATALESS: u32 = 0x4000_0000;
+    std::os::macos::fs::MetadataExt::st_flags(md) & SF_DATALESS != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_cloud_only(_md: &Metadata) -> bool {
+    false
+}
+
 /// Real allocation from the block count; sparse and compressed files are
 /// reported at what they actually occupy. The cluster size is Windows-only.
 pub fn allocated_size(md: &Metadata, _cluster: u64) -> u64 {

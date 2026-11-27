@@ -101,6 +101,8 @@ pub struct WorkerState {
     pub old_large: Vec<FileRec>,
     pub dup_candidates: HashMap<u64, Vec<String>>,
     pub logical_size: u64,
+    /// (count, logical size) of files whose content is not on this disk.
+    pub cloud_only: (u64, u64),
     seq: u64,
     since_report: u32,
 }
@@ -115,6 +117,7 @@ impl WorkerState {
             old_large: Vec::new(),
             dup_candidates: HashMap::new(),
             logical_size: 0,
+            cloud_only: (0, 0),
             seq: 0,
             since_report: 0,
         }
@@ -280,7 +283,10 @@ fn process_dir(
                     let _ = events.send(Event::OsManaged(display.to_string(), logical));
                     continue;
                 }
-                if config.dedup_hardlinks {
+                // Opening or reading a cloud-only file can make its sync client
+                // download it, so the scan does neither.
+                let cloud_only = platform::is_cloud_only(&md);
+                if config.dedup_hardlinks && !cloud_only {
                     if let Some(key) = platform::hardlink_key(&entry, &md) {
                         let first_seen = shared
                             .hardlinks
@@ -301,6 +307,10 @@ fn process_dir(
                 own_size += size;
                 own_files += 1;
                 state.logical_size += logical;
+                if cloud_only {
+                    state.cloud_only.0 += 1;
+                    state.cloud_only.1 += logical;
+                }
 
                 let ext = split_ext(&name);
                 let ext_lower: Box<str> = if ext.is_empty() {
@@ -366,7 +376,7 @@ fn process_dir(
                     });
                 }
 
-                if config.find_duplicates && size >= config.duplicate_min_size {
+                if config.find_duplicates && !cloud_only && size >= config.duplicate_min_size {
                     let display = display_of(&mut display_cache, &job.display, &name);
                     state
                         .dup_candidates
