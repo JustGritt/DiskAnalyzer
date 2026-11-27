@@ -70,6 +70,19 @@ input[type=search]{width:100%;padding:9px 12px;border-radius:9px;border:1px soli
 .dupgroup .hd{font-weight:650;margin-bottom:5px}
 .dupgroup ul{margin:0;padding-left:17px;font-family:ui-monospace,Consolas,monospace;font-size:12px;
   word-break:break-all;color:var(--muted)}
+h3{font-size:12px;margin:18px 0 6px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.grow{color:var(--review);font-weight:600}
+.shrink{color:var(--safe);font-weight:600}
+.warn{color:var(--review)}
+.controls{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin-bottom:12px}
+.controls input[type=search]{flex:1 1 260px;width:auto;margin-bottom:0}
+.controls label{color:var(--muted);font-size:13px;white-space:nowrap;cursor:pointer}
+.toggle{display:flex;gap:4px;align-items:center;margin-bottom:10px;font-size:13px;color:var(--muted)}
+.toggle button{border:1px solid var(--line);background:none;color:var(--ink);font:inherit;
+  padding:3px 10px;border-radius:999px;cursor:pointer}
+.toggle button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+td .kinds{color:var(--muted);font-size:12px}
+.idle{color:var(--review);font-weight:600}
 .foot{color:var(--muted);font-size:12.5px;text-align:center;margin-top:34px}
 .empty{color:var(--muted);font-style:italic}
 </style>
@@ -84,20 +97,51 @@ input[type=search]{width:100%;padding:9px 12px;border-radius:9px;border:1px soli
 
   <div class="cards" id="cards"></div>
 
+  <div class="panel" id="compare-panel">
+    <h2 id="compare-title">Changes</h2>
+    <div id="compare-warnings"></div>
+    <p class="note" style="margin-top:0" id="compare-summary"></p>
+    <h3>Grew</h3>
+    <div id="cmp-grew"></div>
+    <h3>Shrank</h3>
+    <div id="cmp-shrank"></div>
+    <h3>Removed</h3>
+    <div id="cmp-removed"></div>
+  </div>
+
   <div class="panel">
     <h2>Treemap</h2>
+    <div class="toggle" id="color-mode">Color:
+      <button type="button" data-mode="cat" class="on">category</button>
+      <button type="button" data-mode="age">last modified</button>
+    </div>
     <div class="crumbs" id="crumbs"></div>
     <div id="map"></div>
     <div class="legend" id="legend"></div>
     <p class="note">Every rectangle is sized by the space it uses. Click a folder to
       go deeper, and use the trail above to come back. Folders under 8 MB are folded
-      into their parent.</p>
+      into their parent. Color by last modified to see which parts have not changed in
+      a long time.</p>
   </div>
 
   <div class="panel">
     <h2>What is taking the space</h2>
     <div id="cats"></div>
     <p class="note" id="reclaim"></p>
+  </div>
+
+  <div class="panel" id="reclaim-panel">
+    <h2>Reclaimable folders</h2>
+    <p class="note" style="margin-top:0">The top-most regenerable or review folders, with the
+      project each belongs to. <b>Idle</b> is the time since that project last changed, not
+      counting the folder itself: build output is rewritten by every build, so its own dates
+      say little. With no project around it, the folder's own files are used.</p>
+    <div class="controls">
+      <input type="search" id="q-reclaim" placeholder="Filter folders or projects...">
+      <label><input type="checkbox" id="only-idle"> only idle projects</label>
+    </div>
+    <div id="reclaimfolders"></div>
+    <p class="note" id="reclaim-summary"></p>
   </div>
 
   <div class="panel">
@@ -110,6 +154,15 @@ input[type=search]{width:100%;padding:9px 12px;border-radius:9px;border:1px soli
   </div>
 
   <div class="panel">
+    <h2>Files directly inside</h2>
+    <p class="note" style="margin-top:0">Folders ranked by the files sitting directly in
+      them, not in their subfolders. A folder full of loose files shows up here even
+      when none of its subfolders is large.</p>
+    <input type="search" id="q-hotspots" placeholder="Filter folders...">
+    <div id="hotspots"></div>
+  </div>
+
+  <div class="panel">
     <h2>Largest files</h2>
     <input type="search" id="q-files" placeholder="Filter files...">
     <div id="files"></div>
@@ -117,8 +170,7 @@ input[type=search]{width:100%;padding:9px 12px;border-radius:9px;border:1px soli
 
   <div class="panel" id="old-panel">
     <h2>Big and untouched</h2>
-    <p class="note" style="margin-top:0">Large files you have not modified in over a
-      year. Usually the easiest thing to look at first.</p>
+    <p class="note" style="margin-top:0" id="old-note"></p>
     <div id="oldfiles"></div>
   </div>
 
@@ -160,6 +212,26 @@ const PALETTE = {
 };
 const colorOf = k => PALETTE[k] || PALETTE.other;
 
+/* Ages are measured from the scan, not from whenever the page is opened, so
+   they agree with the terminal report and the idle flags computed there. */
+const SCAN_NOW = DATA.scan.now || Date.now()/1000;
+/* Sequential: one hue, darker the longer nothing changed. */
+const AGE_STEPS = [
+  { days:30, label:"under 1 month", color:"#60a5fa" },
+  { days:90, label:"1-3 months", color:"#3b82f6" },
+  { days:365, label:"3-12 months", color:"#2563eb" },
+  { days:730, label:"1-2 years", color:"#1d4ed8" },
+  { days:Infinity, label:"over 2 years", color:"#1e3a8a" },
+];
+const AGE_UNKNOWN = "#94a3b8";
+function ageColor(newest){
+  if(!newest) return AGE_UNKNOWN;
+  const days = (SCAN_NOW - newest) / 86400;
+  return AGE_STEPS.find(s => days < s.days).color;
+}
+let colorMode = "cat";
+const cellColor = d => colorMode === "age" ? ageColor(d.newest) : colorOf(d.cat);
+
 function fmtSize(n){
   if(n === null || n === undefined) return "";
   const u = ["B","KB","MB","GB","TB","PB"];
@@ -168,13 +240,18 @@ function fmtSize(n){
   return i === 0 ? v + " B" : v.toFixed(1) + " " + u[i];
 }
 const fmtNum = n => n.toLocaleString();
-function fmtAge(ts){
+function fmtAge(ts, now){
   if(!ts) return "";
-  const d = Math.max(0, Math.floor((Date.now()/1000 - ts)/86400));
+  const d = Math.max(0, Math.floor(((now || Date.now()/1000) - ts)/86400));
   if(d < 1) return "today";
   if(d < 60) return d + "d";
   if(d < 730) return Math.floor(d/30) + "mo";
   return Math.floor(d/365) + "y";
+}
+const fmtDelta = n => (n > 0 ? "+" : n < 0 ? "-" : "") + fmtSize(Math.abs(n));
+function fmtDays(d){
+  if(d > 0 && d % 365 === 0) return (d/365 === 1) ? "1 year" : (d/365) + " years";
+  return d === 1 ? "1 day" : d + " days";
 }
 function esc(s){
   return String(s).replace(/[&<>"']/g, c =>
@@ -219,7 +296,7 @@ function childrenOf(node){
   const kids = (node.children || []).slice();
   if(node.rest > 0){
     kids.push({ name:"(files in this folder)", path:node.path, size:node.rest,
-                files:0, cat:node.cat, leaf:true });
+                files:0, cat:node.cat, newest:node.newest, leaf:true });
   }
   return kids.filter(k => k.size > 0).sort((a,b) => b.size - a.size);
 }
@@ -295,9 +372,10 @@ function drawMap(){
     const cell = el("div");
     cell.className = "cell" + (isLeaf ? " leaf" : "");
     cell.style.cssText = "left:" + r.x + "px;top:" + r.y + "px;width:" + Math.max(0, r.w - 2) +
-      "px;height:" + Math.max(0, r.h - 2) + "px;background:" + colorOf(r.d.cat);
+      "px;height:" + Math.max(0, r.h - 2) + "px;background:" + cellColor(r.d);
     cell.title = (r.d.path || r.d.name) + "\n" + fmtSize(r.d.size) +
-      (r.d.files ? "\n" + fmtNum(r.d.files) + " files" : "");
+      (r.d.files ? "\n" + fmtNum(r.d.files) + " files" : "") +
+      (r.d.newest ? "\nlast modified " + fmtAge(r.d.newest, SCAN_NOW) + " before the scan" : "");
     if(r.w > 54 && r.h > 26){
       cell.appendChild(el("div", esc(r.d.name))).className = "nm";
       if(r.h > 42) cell.appendChild(el("div", fmtSize(r.d.size))).className = "sz";
@@ -307,17 +385,34 @@ function drawMap(){
   }
 }
 
-(function legend(){
+function drawLegend(){
   const host = document.getElementById("legend");
+  host.innerHTML = "";
+  const swatch = (color, label) => host.appendChild(el("span",
+    '<i style="background:' + color + '"></i>' + esc(label)));
+  if(colorMode === "age"){
+    AGE_STEPS.forEach(s => swatch(s.color, s.label));
+    swatch(AGE_UNKNOWN, "no files");
+    return;
+  }
   const seen = new Set(DATA.categories.map(c => c.key));
   for(const key of seen){
     const meta = DATA.categoryMeta[key];
-    if(!meta) continue;
-    host.appendChild(el("span",
-      '<i style="background:' + colorOf(key) + '"></i>' + esc(meta.label)));
+    if(meta) swatch(colorOf(key), meta.label);
   }
+}
+
+(function colorToggle(){
+  const buttons = document.getElementById("color-mode").querySelectorAll("button");
+  buttons.forEach(b => b.addEventListener("click", () => {
+    colorMode = b.dataset.mode;
+    buttons.forEach(o => o.classList.toggle("on", o === b));
+    drawLegend();
+    drawMap();
+  }));
 })();
 
+drawLegend();
 drawMap();
 let resizeTimer;
 addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(drawMap, 150); });
@@ -409,6 +504,76 @@ document.getElementById("reclaim").innerHTML =
     "</b> is held by duplicate copies" : "") +
   ". DiskAnalyzer only reports these; removing anything is your decision, made elsewhere.";
 
+/* changes since the --compare baseline */
+(function changes(){
+  const c = DATA.compare;
+  if(!c){ document.getElementById("compare-panel").remove(); return; }
+  document.getElementById("compare-title").textContent = "Changes since " + c.base;
+  const warnings = document.getElementById("compare-warnings");
+  for(const w of c.warnings) warnings.appendChild(el("p", esc(w))).className = "note warn";
+  const free = c.volumes.map(v => "free space on " + esc(v.root) + " " + fmtSize(v.freeBefore) +
+    " &rarr; " + fmtSize(v.freeAfter)).join("; ");
+  document.getElementById("compare-summary").innerHTML =
+    "Scanned <b>" + fmtSize(c.beforeTotal) + " &rarr; " + fmtSize(c.afterTotal) + "</b> (" +
+    fmtDelta(c.afterTotal - c.beforeTotal) + ")" + (free ? "; " + free : "") + ". " +
+    "Each row is the folder where a change happened, not every folder above it; changes under " +
+    fmtSize(c.minChange) + " are not listed. Compared with <code>" + esc(c.baseDir) + "</code>.";
+  const columns = [
+    { label:"Change", cls:"num", sort:r => r.delta, cell:r =>
+        '<span class="' + (r.delta > 0 ? "grow" : "shrink") + '">' + fmtDelta(r.delta) + '</span>' },
+    { label:"Before", cls:"num", sort:r => r.before === null ? -1 : r.before, cell:r =>
+        r.before === null ? "new" : fmtSize(r.before) },
+    { label:"After", cls:"num", sort:r => r.after === null ? -1 : r.after, cell:r =>
+        r.after === null ? esc(r.status) : fmtSize(r.after) + (r.status === "unreadable" ? " (unreadable)" : "") },
+    { label:"Folder", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
+  ];
+  renderTable("cmp-grew", columns, c.grew);
+  renderTable("cmp-shrank", columns, c.shrank);
+  renderTable("cmp-removed", columns, c.removed);
+})();
+
+/* reclaimable folders */
+(function reclaimFolders(){
+  const rows = DATA.reclaimFolders || [];
+  if(!rows.length){ document.getElementById("reclaim-panel").remove(); return; }
+  const input = document.getElementById("q-reclaim");
+  const onlyIdle = document.getElementById("only-idle");
+  const columns = [
+    { label:"Size", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
+    { label:"Category", sort:r => r.cat, cell:r => tagFor(r.cat) },
+    { label:"Idle", cls:"num", sort:r => r.activity ? SCAN_NOW - r.activity : -1, cell:r => {
+        const text = r.activity ? fmtAge(r.activity, SCAN_NOW) : "unknown";
+        return r.stale ? '<span class="idle">' + esc(text) + '</span>' : esc(text);
+      } },
+    { label:"Project", sort:r => r.project || "", cell:r => r.project
+        ? '<span title="' + esc(r.projectPath) + '">' + esc(r.project) + '</span>' +
+          (r.projectKinds.length ? ' <span class="kinds">' + esc(r.projectKinds.join(", ")) + '</span>' : "")
+        : '<span class="empty">none found</span>' },
+    { label:"Folder", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
+    { label:"To reclaim", sort:r => r.hint || "", cell:r => esc(r.hint || "") },
+  ];
+  const draw = () => {
+    const needle = input.value.trim().toLowerCase();
+    renderTable("reclaimfolders", columns, rows.filter(r =>
+      (!onlyIdle.checked || r.stale) &&
+      (!needle || (r.path + "\n" + (r.projectPath || "")).toLowerCase().includes(needle))));
+  };
+  input.addEventListener("input", draw);
+  onlyIdle.addEventListener("change", draw);
+  draw();
+
+  const count = DATA.reclaimFoldersCount || rows.length;
+  document.getElementById("reclaim-summary").innerHTML =
+    fmtNum(count) + " folder" + (count === 1 ? "" : "s") + " over " + fmtSize(DATA.reclaimFoldersMinSize) +
+    ", <b>" + fmtSize(DATA.reclaimFoldersTotal) + "</b> in all" +
+    (count > rows.length ? " (largest " + fmtNum(rows.length) + " listed)" : "") +
+    (DATA.reclaimFoldersStale ? "; <b>" + fmtSize(DATA.reclaimFoldersStale) + "</b> idle for " +
+      fmtDays(DATA.config.staleDays) + " or more" : "") +
+    ". Single files such as disc images are not folders; see Largest files." +
+    (rows.some(r => r.hint) ? " <b>To reclaim</b> is how the folder's own tool clears it;" +
+      " DiskAnalyzer shows that and never runs it." : "");
+})();
+
 /* folders */
 filterable("q-folders", "folders", [
   { label:"Size", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
@@ -416,6 +581,14 @@ filterable("q-folders", "folders", [
   { label:"Category", sort:r => r.cat, cell:r => tagFor(r.cat) },
   { label:"Folder", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
 ], DATA.folders, r => r.path);
+
+/* folders ranked by the files directly inside them */
+filterable("q-hotspots", "hotspots", [
+  { label:"Files here", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
+  { label:"Count", cls:"num", sort:r => r.files, cell:r => fmtNum(r.files) },
+  { label:"Category", sort:r => r.cat, cell:r => tagFor(r.cat) },
+  { label:"Folder", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
+], DATA.hotspots, r => r.path);
 
 /* files */
 filterable("q-files", "files", [
@@ -426,6 +599,9 @@ filterable("q-files", "files", [
 
 /* old files */
 if(DATA.oldFiles.length){
+  document.getElementById("old-note").textContent =
+    "Files over " + fmtSize(DATA.scan.oldMinSize) + " you have not modified for " +
+    fmtDays(DATA.scan.oldMinDays) + " or more. Usually the easiest thing to look at first.";
   renderTable("oldfiles", [
     { label:"Size", cls:"num", sort:r => r.size, cell:r => fmtSize(r.size) },
     { label:"Age", cls:"num", sort:r => r.mtime, cell:r => fmtAge(r.mtime) },
@@ -481,13 +657,30 @@ renderTable("ages", [
   bits.push("Roots scanned: <b>" + DATA.scan.roots.map(esc).join(", ") + "</b>.");
   bits.push("Sizes are " + (s.allocated ? "rounded up to whole clusters (on-disk estimate)"
     : "logical file sizes") + ".");
-  if(s.skipped) bits.push("<b>" + fmtNum(s.skipped) + "</b> paths skipped" +
-    (s.includeOs ? "" : ", including the live " + esc(s.osName) + " installation") + ".");
+  if(s.skipped){
+    const reasons = s.skippedByReason || [];
+    bits.push("<b>" + fmtNum(s.skipped) + "</b> paths skipped (" +
+      reasons.map(r => esc(r.reason) + ": " + fmtNum(r.count)).join(", ") + ")" +
+      (reasons.some(r => r.os) ? ", including parts of the live " + esc(s.osName) +
+        " installation that --include-os would scan" : "") + ".");
+  }
   if(s.links) bits.push("<b>" + fmtNum(s.links) +
     "</b> junctions and symlinks were recorded but not followed, so nothing is counted twice.");
   if(s.errors) bits.push("<b>" + fmtNum(s.errors) +
     "</b> paths could not be read; " + esc(s.errorsHint) + " to reach more of them.");
   host.appendChild(el("p", bits.join(" "))).className = "note";
+
+  if(DATA.skippedPaths.length){
+    host.appendChild(el("h2", "Skipped folders"));
+    renderTable(host.appendChild(el("div")), [
+      { label:"Folder", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
+      { label:"Reason", sort:r => r.reason, cell:r => esc(r.reason) },
+    ], DATA.skippedPaths);
+    if(s.skipped > DATA.skippedPaths.length){
+      host.appendChild(el("p", "Showing the first " + fmtNum(DATA.skippedPaths.length) +
+        " of " + fmtNum(s.skipped) + " skipped folders.")).className = "note";
+    }
+  }
 
   if(DATA.osManaged.length){
     host.appendChild(el("h2", "OS-managed files"));

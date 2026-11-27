@@ -3,7 +3,11 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::categories::{CatId, Confidence, ALL};
-use crate::scanner::{FileRec, ScanResult, AGE_BUCKETS, NO_PARENT};
+use crate::compare::Comparison;
+use crate::exclusions;
+use crate::platform;
+use crate::projects;
+use crate::scanner::{FileRec, ScanResult, AGE_BUCKETS, NO_PARENT, SECONDS_PER_DAY};
 use crate::util::Json;
 
 /// When a folder holds this much of its parent, the parent tells you nothing
@@ -35,8 +39,81 @@ pub struct Reclaimable {
     pub duplicates: u64,
 }
 
+/// Report settings that are not part of the scan itself. Kept on the
+/// `Report` so every writer (and `report.json`) can state what it used.
+#[derive(Clone, Debug)]
+pub struct ReportOptions {
+    /// Folders per ranking (`--top`).
+    pub top_n: usize,
+    /// Files per ranking (`--files`).
+    pub file_n: usize,
+    pub with_duplicates: bool,
+    /// Floor for `files.csv` (`--csv-min-size`).
+    pub csv_min_size: u64,
+    /// Floor for `folders.csv` (`--folder-min-size`).
+    pub folder_min_size: u64,
+    /// A project untouched this long counts as idle (`--stale-days`).
+    pub stale_days: u64,
+}
+
+impl Default for ReportOptions {
+    fn default() -> ReportOptions {
+        ReportOptions {
+            top_n: 25,
+            file_n: 30,
+            with_duplicates: false,
+            csv_min_size: 10 * 1024 * 1024,
+            folder_min_size: 1024 * 1024,
+            stale_days: 90,
+        }
+    }
+}
+
+/// Reclaimable folders smaller than this are not listed: below it, the
+/// time spent looking costs more than the space returned.
+pub const RECLAIM_MIN_SIZE: u64 = 64 * 1024 * 1024;
+
+/// How far above a reclaimable folder to look for the project that owns it.
+/// Four levels reach `Game/Library/Bee` and `repo/packages/app/node_modules`.
+const PROJECT_SEARCH_DEPTH: usize = 4;
+
+/// A top-most regenerable or review folder, with the project it belongs to.
+#[derive(Clone, Debug)]
+pub struct ReclaimFolder {
+    pub id: u32,
+    pub category: CatId,
+    pub size: u64,
+    pub files: u64,
+    /// Node id of the owning project, when one was recognized.
+    pub project: Option<u32>,
+    /// Last activity of the project around the folder, not counting any
+    /// reclaimable folder's contents; the folder's own newest mtime when no
+    /// project was found. 0 when unknown.
+    pub activity: f64,
+    /// Newest mtime inside the folder itself.
+    pub contents_newest: f64,
+    pub stale: bool,
+    /// How the tool that owns the folder clears it, when that is known.
+    /// Printed for the reader; never run.
+    pub hint: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ReclaimFolders {
+    /// Largest first, at most `top_n`.
+    pub folders: Vec<ReclaimFolder>,
+    /// How many folders cleared the size floor, before truncation.
+    pub count: usize,
+    /// Bytes in all of them. Top-most folders never nest, so this does not
+    /// double count.
+    pub total: u64,
+    /// Bytes in the ones marked stale.
+    pub stale: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct Report {
+    pub options: ReportOptions,
     /// Node ids, largest first.
     pub top_folders: Vec<u32>,
     pub hotspots: Vec<u32>,
@@ -53,6 +130,9 @@ pub struct Report {
     pub duplicates: Vec<DuplicateGroup>,
     pub duplicates_truncated: bool,
     pub reclaimable: Reclaimable,
+    pub reclaim_folders: ReclaimFolders,
+    /// Set by the CLI when `--compare` names a baseline.
+    pub comparison: Option<Comparison>,
 }
 
 /// Largest `total_size` among each node's direct children.
@@ -88,6 +168,181 @@ pub fn collapse_chains(result: &ScanResult, limit: usize) -> Vec<u32> {
     });
     interesting.truncate(limit);
     interesting
+}
+
+/// The user's home folder, which is never taken as a project: a dotfiles
+/// repository in `~` must not claim `~/Library/Caches`.
+fn home_dir() -> Option<String> {
+    let vars: [&str; 2] = if cfg!(windows) {
+        ["USERPROFILE", "HOME"]
+    } else {
+        ["HOME", "USERPROFILE"]
+    };
+    vars.iter()
+        .filter_map(std::env::var_os)
+        .map(|v| v.to_string_lossy().into_owned())
+        .find(|v| !v.is_empty())
+}
+
+/// How the tool that owns a reclaimable folder clears it. `path` is in the
+/// lowercased, slash-normalized form `categories` matches against.
+///
+/// A wrong command is worse than none: every suffix is a folder the
+/// classifier lists on its own, and anything else gets `None`. The markers
+/// are those of the folder's parent rather than of the owning project,
+/// because `cargo clean` empties the `target` beside a `Cargo.toml` wherever
+/// the repository root is, and a global `node_modules` has no `package.json`
+/// to restore it from.
+fn reclaim_hint(path: &str, parent_markers: u16) -> Option<&'static str> {
+    const VENV: &str = "delete the folder and recreate it with the tool that made it";
+    const NUGET: &str = "dotnet nuget locals all --clear";
+    const NPM: &str = "npm cache clean --force";
+    #[rustfmt::skip]
+    const HINTS: &[(&str, u16, &str)] = &[
+        ("/target", projects::RUST, "cargo clean"),
+        ("/build", projects::GRADLE, "./gradlew clean"),
+        ("/node_modules", projects::NODE, "delete the folder; the package manager's install command restores it"),
+        ("/.venv", 0, VENV),
+        ("/venv", 0, VENV),
+        ("/appdata/local/npm-cache", 0, NPM),
+        ("/appdata/roaming/npm-cache", 0, NPM),
+        ("/appdata/local/pnpm", 0, "pnpm store prune"),
+        ("/appdata/local/yarn/cache", 0, "yarn cache clean"),
+        ("/appdata/local/uv/cache", 0, "uv cache clean"),
+        ("/appdata/local/pip/cache", 0, "pip cache purge"),
+        ("/appdata/local/nuget", 0, NUGET),
+        ("/.nuget", 0, NUGET),
+        ("/.conda", 0, "conda clean --all"),
+        ("/library/developer/coresimulator", 0, "xcrun simctl delete unavailable"),
+    ];
+    HINTS
+        .iter()
+        .find(|(suffix, needs, _)| path.ends_with(suffix) && parent_markers & needs == *needs)
+        .map(|&(_, _, hint)| hint)
+}
+
+/// Find the top-most regenerable or review folders and the projects they
+/// belong to. Linear passes over the arena; parents precede children.
+///
+/// Why activity skips the folders themselves: build output is rewritten by
+/// every build and package stores may keep archive mtimes, so a folder's own
+/// timestamps say little about whether anyone still works on the project.
+/// The source tree around it does.
+pub fn reclaim_folders(
+    result: &ScanResult,
+    top_n: usize,
+    stale_days: u64,
+    min_size: u64,
+    home: Option<&str>,
+) -> ReclaimFolders {
+    let nodes = &result.nodes;
+    let count = nodes.len();
+
+    // Forward pass: which folders are top-most candidates. A candidate inside
+    // another folds into it, and anything inside an installed app or game is
+    // that app's business, not a project's leftovers.
+    let mut in_app = vec![false; count];
+    let mut is_root = vec![false; count];
+    let mut covered = vec![false; count];
+    for id in 0..count {
+        let node = &nodes[id];
+        let (parent_in_app, parent_covered) = match node.parent {
+            NO_PARENT => (false, false),
+            parent => (in_app[parent as usize], covered[parent as usize]),
+        };
+        in_app[id] = parent_in_app || matches!(node.category, Some(CatId::Apps | CatId::Games));
+        let reclaimable = node
+            .category
+            .is_some_and(|cat| matches!(cat.confidence(), Confidence::Safe | Confidence::Review));
+        is_root[id] = reclaimable && !parent_covered && !parent_in_app;
+        covered[id] = parent_covered || is_root[id];
+    }
+
+    // Backward pass: activity rolls up like `newest`, except that a
+    // candidate's subtree never feeds its parent.
+    let mut quiet_newest: Vec<f64> = nodes.iter().map(|node| node.own_newest).collect();
+    for id in (0..count).rev() {
+        let parent = nodes[id].parent;
+        if parent == NO_PARENT || is_root[id] {
+            continue;
+        }
+        let parent = parent as usize;
+        quiet_newest[parent] = quiet_newest[parent].max(quiet_newest[id]);
+    }
+
+    let mut kept: Vec<u32> = (0..count as u32)
+        .filter(|&id| is_root[id as usize] && nodes[id as usize].total_size >= min_size)
+        .collect();
+    kept.sort_by(|&a, &b| {
+        nodes[b as usize]
+            .total_size
+            .cmp(&nodes[a as usize].total_size)
+            .then(a.cmp(&b))
+    });
+
+    let home_key = home.map(exclusions::normalize_key);
+    let not_a_project = |id: u32| {
+        let node = &nodes[id as usize];
+        (node.parent == NO_PARENT && platform::is_volume_root(&node.name))
+            || home_key
+                .as_ref()
+                .is_some_and(|home| exclusions::normalize_key(&result.node_path(id)) == *home)
+    };
+    let find_project = |id: u32| {
+        let mut nearest_any = None;
+        let mut cur = nodes[id as usize].parent;
+        for _ in 0..PROJECT_SEARCH_DEPTH {
+            if cur == NO_PARENT {
+                break;
+            }
+            let markers = nodes[cur as usize].markers;
+            if markers != 0 && !not_a_project(cur) {
+                if markers & projects::GIT != 0 {
+                    return Some(cur);
+                }
+                nearest_any.get_or_insert(cur);
+            }
+            cur = nodes[cur as usize].parent;
+        }
+        nearest_any
+    };
+
+    let stale_after = stale_days as f64 * SECONDS_PER_DAY;
+    let mut out = ReclaimFolders {
+        count: kept.len(),
+        ..Default::default()
+    };
+    for id in kept {
+        let node = &nodes[id as usize];
+        let project = find_project(id);
+        let own = quiet_newest[id as usize];
+        let activity = match project {
+            Some(project) if quiet_newest[project as usize] > 0.0 => quiet_newest[project as usize],
+            _ => own,
+        };
+        let stale = activity > 0.0 && result.now - activity >= stale_after;
+        out.total += node.total_size;
+        if stale {
+            out.stale += node.total_size;
+        }
+        if out.folders.len() < top_n {
+            out.folders.push(ReclaimFolder {
+                id,
+                category: node.category.unwrap_or(CatId::Other),
+                size: node.total_size,
+                files: node.total_files,
+                project,
+                activity,
+                contents_newest: node.newest,
+                stale,
+                hint: reclaim_hint(
+                    &platform::lower_slash(&result.node_path(id)),
+                    nodes.get(node.parent as usize).map_or(0, |p| p.markers),
+                ),
+            });
+        }
+    }
+    out
 }
 
 fn read_signature(path: &str, size: u64, spent: &mut u64) -> std::io::Result<[u8; 32]> {
@@ -166,6 +421,13 @@ pub fn find_duplicates(
         for (_, mut matched) in by_signature {
             if matched.len() > 1 {
                 matched.sort();
+                // Hard links to one file share its bytes: keep one name each.
+                let mut seen = std::collections::HashSet::new();
+                matched.retain(|path| {
+                    platform::hardlink_key_of(path).is_none_or(|key| seen.insert(key))
+                });
+            }
+            if matched.len() > 1 {
                 groups.push(DuplicateGroup {
                     size,
                     paths: matched,
@@ -178,13 +440,11 @@ pub fn find_duplicates(
     (groups, truncated)
 }
 
-pub fn build_report(
-    result: &mut ScanResult,
-    top_n: usize,
-    file_n: usize,
-    with_duplicates: bool,
-) -> Report {
+pub fn build_report(result: &mut ScanResult, options: &ReportOptions) -> Report {
+    let top_n = options.top_n;
+    let file_n = options.file_n;
     let mut report = Report {
+        options: options.clone(),
         top_folders: collapse_chains(result, top_n),
         ..Default::default()
     };
@@ -247,7 +507,7 @@ pub fn build_report(
     report.top_files = result.top_files.iter().take(file_n).cloned().collect();
     report.old_files = result.sorted_old_files().into_iter().take(file_n).collect();
 
-    if with_duplicates {
+    if options.with_duplicates {
         let (groups, truncated) =
             find_duplicates(result, DUPLICATE_MAX_GROUPS, DUPLICATE_READ_BUDGET);
         report.duplicates = groups;
@@ -264,6 +524,14 @@ pub fn build_report(
     }
     reclaimable.duplicates = report.duplicates.iter().map(DuplicateGroup::wasted).sum();
     report.reclaimable = reclaimable;
+
+    report.reclaim_folders = reclaim_folders(
+        result,
+        top_n,
+        options.stale_days,
+        RECLAIM_MIN_SIZE,
+        home_dir().as_deref(),
+    );
 
     report
 }
@@ -317,7 +585,8 @@ pub fn build_tree(result: &ScanResult, min_size: u64, max_nodes: usize) -> Optio
             .set("path", path)
             .set("size", node.total_size)
             .set("files", node.total_files)
-            .set("cat", node.category.unwrap_or(CatId::Other).key());
+            .set("cat", node.category.unwrap_or(CatId::Other).key())
+            .set("newest", node.newest);
         // Bytes not covered by a listed child: files directly here plus every
         // subfolder too small to draw. Without this the treemap would not add up.
         if !kids.is_empty() {
@@ -346,6 +615,11 @@ pub fn build_tree(result: &ScanResult, min_size: u64, max_nodes: usize) -> Optio
         return Some(roots.into_iter().next().unwrap().0);
     }
     let size: u64 = roots.iter().map(|(_, s)| s).sum();
+    let newest = result
+        .root_ids
+        .iter()
+        .map(|&id| result.nodes[id as usize].newest)
+        .fold(0.0, f64::max);
     Some(
         Json::obj()
             .set("name", "Scanned roots")
@@ -353,6 +627,7 @@ pub fn build_tree(result: &ScanResult, min_size: u64, max_nodes: usize) -> Optio
             .set("size", size)
             .set("files", result.total_files)
             .set("cat", "other")
+            .set("newest", newest)
             .set(
                 "children",
                 roots.into_iter().map(|(j, _)| j).collect::<Vec<_>>(),
@@ -370,13 +645,180 @@ mod tests {
             name: name.into(),
             parent,
             depth,
-            category: None,
             own_size,
             own_files: 1,
-            total_size: 0,
-            total_files: 0,
-            total_dirs: 0,
+            ..Default::default()
         }
+    }
+
+    const DAY: f64 = SECONDS_PER_DAY;
+    const NOW: f64 = 2_000_000_000.0;
+
+    /// A node for the reclaim tests: category, markers and newest file age.
+    fn dir(name: &str, parent: u32, cat: Option<CatId>, markers: u16, age_days: f64) -> DirNode {
+        DirNode {
+            name: name.into(),
+            parent,
+            category: cat,
+            markers,
+            own_size: 100,
+            own_files: 1,
+            own_newest: NOW - age_days * DAY,
+            ..Default::default()
+        }
+    }
+
+    fn reclaim_result(nodes: Vec<DirNode>) -> ScanResult {
+        let mut result = fake_result(nodes);
+        result.now = NOW;
+        result
+    }
+
+    fn listed(result: &ScanResult, found: &ReclaimFolders) -> Vec<String> {
+        found
+            .folders
+            .iter()
+            .map(|f| result.nodes[f.id as usize].name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn idle_project_is_judged_by_its_source_not_its_build_output() {
+        let result = reclaim_result(vec![
+            dir("/", NO_PARENT, None, 0, 1.0),
+            dir("proj", 0, None, projects::RUST, 200.0),
+            dir("src", 1, None, 0, 200.0),
+            dir("target", 1, Some(CatId::DevBuild), 0, 1.0),
+            dir("debug", 3, Some(CatId::DevBuild), 0, 1.0),
+        ]);
+        let found = reclaim_folders(&result, 10, 90, 0, None);
+        assert_eq!(listed(&result, &found), vec!["target"]);
+        let folder = &found.folders[0];
+        assert_eq!(folder.project, Some(1));
+        assert_eq!(folder.activity, NOW - 200.0 * DAY);
+        assert_eq!(folder.contents_newest, NOW - DAY);
+        assert!(folder.stale);
+        assert_eq!(folder.hint, Some("cargo clean"));
+        assert_eq!(found.count, 1);
+        assert_eq!(found.total, 200);
+        assert_eq!(found.stale, 200);
+
+        // The same project, touched yesterday, is not idle.
+        let fresh = reclaim_folders(&result, 10, 250, 0, None);
+        assert!(!fresh.folders[0].stale);
+        assert_eq!(fresh.stale, 0);
+    }
+
+    #[test]
+    fn only_the_top_most_reclaimable_folder_is_listed() {
+        let result = reclaim_result(vec![
+            dir("/", NO_PARENT, None, 0, 1.0),
+            dir("node_modules", 0, Some(CatId::DevDeps), 0, 5.0),
+            dir("x", 1, Some(CatId::DevDeps), 0, 5.0),
+            dir("android", 2, Some(CatId::DevDeps), 0, 5.0),
+            dir("build", 3, Some(CatId::DevBuild), 0, 5.0),
+        ]);
+        let found = reclaim_folders(&result, 10, 90, 0, None);
+        assert_eq!(listed(&result, &found), vec!["node_modules"]);
+        assert_eq!(found.total, 400);
+        // No project around it: activity is the folder's own contents.
+        assert_eq!(found.folders[0].project, None);
+        assert_eq!(found.folders[0].activity, NOW - 5.0 * DAY);
+    }
+
+    #[test]
+    fn caches_inside_installed_apps_are_left_out() {
+        let result = reclaim_result(vec![
+            dir("/", NO_PARENT, None, 0, 1.0),
+            dir("Unity", 0, Some(CatId::Apps), 0, 1.0),
+            dir("emscripten", 1, Some(CatId::Apps), 0, 1.0),
+            dir("cache", 2, Some(CatId::AppCache), 0, 1.0),
+        ]);
+        let found = reclaim_folders(&result, 10, 90, 0, None);
+        assert!(found.folders.is_empty());
+        assert_eq!(found.count, 0);
+    }
+
+    #[test]
+    fn a_repository_in_the_home_folder_is_not_a_project() {
+        let home = if cfg!(windows) {
+            r"C:\Users\me"
+        } else {
+            "/home/me"
+        };
+        let result = reclaim_result(vec![
+            dir(home, NO_PARENT, None, projects::GIT, 1.0),
+            dir("Library", 0, None, 0, 1.0),
+            dir("Caches", 1, Some(CatId::AppCache), 0, 400.0),
+        ]);
+        let found = reclaim_folders(&result, 10, 90, 0, Some(home));
+        assert_eq!(found.folders[0].project, None);
+        assert!(found.folders[0].stale, "judged by its own contents instead");
+
+        // Without the home rule the dotfiles repository would claim it.
+        let claimed = reclaim_folders(&result, 10, 90, 0, None);
+        assert_eq!(claimed.folders[0].project, Some(0));
+    }
+
+    #[test]
+    fn git_beats_a_nearer_marker_and_the_floor_and_limit_apply() {
+        let result = reclaim_result(vec![
+            dir("/", NO_PARENT, None, 0, 1.0),
+            dir("repo", 0, None, projects::GIT, 10.0),
+            dir("packages", 1, None, 0, 10.0),
+            dir("app", 2, None, projects::NODE, 10.0),
+            dir("node_modules", 3, Some(CatId::DevDeps), 0, 10.0),
+            dir("tmp", 1, Some(CatId::Temp), 0, 10.0),
+        ]);
+        let found = reclaim_folders(&result, 10, 90, 0, None);
+        let nm = found
+            .folders
+            .iter()
+            .find(|f| &*result.nodes[f.id as usize].name == "node_modules")
+            .unwrap();
+        assert_eq!(nm.project, Some(1));
+
+        let limited = reclaim_folders(&result, 1, 90, 0, None);
+        assert_eq!(limited.folders.len(), 1);
+        assert_eq!(limited.count, 2);
+        assert_eq!(limited.total, 200);
+
+        assert_eq!(reclaim_folders(&result, 10, 90, 101, None).count, 0);
+    }
+
+    #[test]
+    fn a_hint_is_the_owning_tools_cleanup_or_nothing() {
+        let rust = projects::GIT | projects::RUST;
+        assert_eq!(
+            reclaim_hint("c:/work/app/target", rust),
+            Some("cargo clean")
+        );
+        assert_eq!(
+            reclaim_hint("/home/me/app/android/build", projects::GRADLE),
+            Some("./gradlew clean")
+        );
+        assert_eq!(
+            reclaim_hint("c:/users/me/appdata/local/npm-cache", 0),
+            Some("npm cache clean --force")
+        );
+        assert_eq!(
+            reclaim_hint("c:/users/me/appdata/local/pip/cache", 0),
+            Some("pip cache purge")
+        );
+        assert!(reclaim_hint("/home/me/site/.venv", 0).is_some());
+
+        // The project decides: Maven builds into `target` too, and a global
+        // `node_modules` has no `package.json` beside it.
+        assert_eq!(reclaim_hint("/home/me/svc/target", projects::MAVEN), None);
+        assert!(reclaim_hint("c:/work/site/node_modules", projects::NODE).is_some());
+        assert_eq!(
+            reclaim_hint("c:/users/me/appdata/roaming/npm/node_modules", 0),
+            None
+        );
+
+        // Reclaimable, but no tool of its own to clear it.
+        assert_eq!(reclaim_hint("c:/users/me/appdata/local/temp", 0), None);
+        assert_eq!(reclaim_hint("c:/work/site/dist", projects::NODE), None);
     }
 
     fn fake_result(nodes: Vec<DirNode>) -> ScanResult {

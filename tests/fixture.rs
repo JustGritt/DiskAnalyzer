@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use diskanalyzer::categories::CatId;
-use diskanalyzer::insights::build_report;
+use diskanalyzer::insights::{build_report, reclaim_folders, ReportOptions};
+use diskanalyzer::platform;
+use diskanalyzer::projects;
 use diskanalyzer::reports::csv::{write_folder_csv, FileListWriter};
 use diskanalyzer::reports::html;
 use diskanalyzer::reports::sink::OutputDir;
 use diskanalyzer::reports::terminal;
 use diskanalyzer::scanner::{scan, FileSink, ScanConfig, ScanResult, SECONDS_PER_DAY};
-use diskanalyzer::util::now_epoch;
+use diskanalyzer::util::{now_epoch, Json};
 
 const DUP_BYTES: usize = 30_000;
 
@@ -44,8 +46,15 @@ fn write(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
 }
 
+/// A temp directory under Cargo's target dir. The system temp folder would
+/// classify the whole fixture on Windows, where `AppData\Local\Temp` matches
+/// the Temp rule.
+fn temp_dir() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
+}
+
 fn build_fixture() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     let root = dir.path().join("root");
     fs::create_dir_all(root.join("a/node_modules")).unwrap();
     fs::create_dir_all(root.join("b")).unwrap();
@@ -118,6 +127,13 @@ fn config_for(fixture: &Fixture, threads: usize) -> ScanConfig {
     }
 }
 
+fn with_duplicates() -> ReportOptions {
+    ReportOptions {
+        with_duplicates: true,
+        ..ReportOptions::default()
+    }
+}
+
 fn node_table(result: &ScanResult) -> BTreeMap<String, (u64, u64, u32)> {
     let paths = result.all_paths();
     result
@@ -145,7 +161,12 @@ fn totals_categories_links_skips_and_errors() {
     let table = node_table(&result);
     let a = &table[&fixture.root.join("a").display().to_string()];
     assert_eq!(*a, (15_000, 11, 1));
-    let nm = &table[&fixture.root.join("a/node_modules").display().to_string()];
+    let nm = &table[&fixture
+        .root
+        .join("a")
+        .join("node_modules")
+        .display()
+        .to_string()];
     assert_eq!(*nm, (5_000, 1, 0));
     assert!(table.contains_key(&fixture.root.join("empty").display().to_string()));
     assert!(!table.contains_key(&fixture.root.join("skipme").display().to_string()));
@@ -208,10 +229,71 @@ fn parallel_scan_matches_serial_scan() {
 }
 
 #[test]
+fn dedup_hardlinks_counts_a_linked_file_once() {
+    let fixture = build_fixture();
+    // A second name for b/Archive.TAR.GZ (20 000 bytes) in another folder.
+    fs::create_dir_all(fixture.root.join("links")).unwrap();
+    fs::hard_link(
+        fixture.root.join("b/Archive.TAR.GZ"),
+        fixture.root.join("links/archive-again.tar.gz"),
+    )
+    .unwrap();
+    let mut config = config_for(&fixture, 4);
+
+    let counted = scan(&config, None, 0, None);
+    assert_eq!(counted.total_size, EXPECTED_SIZE + 20_000);
+    assert_eq!(counted.total_files, EXPECTED_FILES + 1);
+
+    config.dedup_hardlinks = true;
+    for threads in [1, 4] {
+        config.threads = threads;
+        let deduped = scan(&config, None, 0, None);
+        assert_eq!(deduped.total_size, EXPECTED_SIZE, "threads={threads}");
+        assert_eq!(deduped.total_files, EXPECTED_FILES, "threads={threads}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn cloud_only_files_are_counted_but_never_read() {
+    let fixture = build_fixture();
+    let mut config = config_for(&fixture, 4);
+    config.use_allocated = true;
+    let on_disk = scan(&config, None, 0, None).total_size;
+
+    // The offline attribute is one of those a sync client sets on a file
+    // whose content it has not downloaded.
+    let marked = Command::new("attrib")
+        .arg("+O")
+        .arg(fixture.root.join("dup1.bin"))
+        .status()
+        .unwrap();
+    assert!(marked.success());
+
+    // 30 000 bytes round up to eight 4 KB clusters; a placeholder holds none.
+    let allocated = scan(&config, None, 0, None);
+    assert_eq!(on_disk - allocated.total_size, 32_768);
+    assert_eq!(allocated.total_files, EXPECTED_FILES);
+
+    config.use_allocated = false;
+    let mut result = scan(&config, None, 0, None);
+    assert_eq!(result.cloud_only, (1, DUP_BYTES as u64));
+    assert_eq!(result.total_size, EXPECTED_SIZE, "logical sizing unchanged");
+    // dup2.bin is left without a partner.
+    let report = build_report(&mut result, &with_duplicates());
+    assert!(report.duplicates.is_empty(), "{:?}", report.duplicates);
+
+    let text = terminal::render(&report, &result, false, 100);
+    assert!(text.contains("1 cloud-only files (29.3 KB)"), "{text}");
+    let page = html::render(&report, &result);
+    assert!(page.contains(r#""cloudOnlyFiles":1,"cloudOnlyBytes":30000"#));
+}
+
+#[test]
 fn duplicates_need_matching_content_not_just_size() {
     let fixture = build_fixture();
     let mut result = scan(&config_for(&fixture, 4), None, 0, None);
-    let report = build_report(&mut result, 25, 30, true);
+    let report = build_report(&mut result, &with_duplicates());
     assert_eq!(report.duplicates.len(), 1);
     let group = &report.duplicates[0];
     assert_eq!(group.size, DUP_BYTES as u64);
@@ -228,9 +310,32 @@ fn duplicates_need_matching_content_not_just_size() {
 }
 
 #[test]
+fn duplicates_count_hard_links_to_one_file_once() {
+    let fixture = build_fixture();
+    // A second name for one of the two copies, and one for a file that has
+    // no duplicate: neither link is another copy.
+    fs::hard_link(
+        fixture.root.join("dup1.bin"),
+        fixture.root.join("dup1-link.bin"),
+    )
+    .unwrap();
+    fs::hard_link(
+        fixture.root.join("same-size-different.bin"),
+        fixture.root.join("different-link.bin"),
+    )
+    .unwrap();
+    let mut result = scan(&config_for(&fixture, 4), None, 0, None);
+    let report = build_report(&mut result, &with_duplicates());
+    assert_eq!(report.duplicates.len(), 1, "{:?}", report.duplicates);
+    let group = &report.duplicates[0];
+    assert_eq!(group.paths.len(), 2, "{:?}", group.paths);
+    assert_eq!(group.wasted(), DUP_BYTES as u64);
+}
+
+#[test]
 fn reports_render_and_csvs_stream() {
     let fixture = build_fixture();
-    let out_dir = tempfile::tempdir().unwrap();
+    let out_dir = temp_dir();
     let output = OutputDir::create(&out_dir.path().join("nested/reports")).unwrap();
 
     let mut writer = FileListWriter::new(&output, 0).unwrap();
@@ -258,7 +363,7 @@ fn reports_render_and_csvs_stream() {
         "{first_row}"
     );
 
-    let report = build_report(&mut result, 25, 30, true);
+    let report = build_report(&mut result, &with_duplicates());
     let text = terminal::render(&report, &result, false, 100);
     assert!(text.contains("DISK ANALYZER"));
     assert!(text.contains("-- WHERE THE SPACE IS"));
@@ -266,6 +371,12 @@ fn reports_render_and_csvs_stream() {
     assert!(text.contains("-- BIG AND UNTOUCHED"));
     assert!(text.contains("[dev-deps]"));
     assert!(text.contains("Nothing was modified, moved or deleted."));
+    // Only the user's own --exclude-name was skipped, and this is a folder
+    // scan: neither the OS hint nor a volume coverage share applies.
+    assert!(text.contains("Skipped  1 paths (user-excluded name)"));
+    assert!(!text.contains("--include-os"));
+    assert!(!text.contains("of used space"));
+    assert!(text.contains("not modified for 1 year or more"));
     let colored = terminal::render(&report, &result, true, 60);
     assert!(colored.contains("\x1b[1m"));
 
@@ -276,25 +387,113 @@ fn reports_render_and_csvs_stream() {
         "fixture is far below the 8 MB treemap floor"
     );
     assert!(page.contains(r#""duplicates":[{"size":30000"#));
+    assert!(page
+        .contains(r#""skippedByReason":[{"reason":"user-excluded name","count":1,"os":false}]"#));
+    assert!(page.contains(r#""oldMinDays":365"#));
     assert!(!page.contains("__PAYLOAD__"));
     html::write_html(&report, &result, &output).unwrap();
     assert!(output.join("report.html").is_file());
 }
 
+/// Set a file's modification time. Test-only: the crate itself can never
+/// do this.
+fn backdate(path: &Path, days: f64) {
+    let when =
+        std::time::SystemTime::now() - std::time::Duration::from_secs_f64(days * SECONDS_PER_DAY);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+#[test]
+fn reclaimable_folders_are_judged_by_their_project() {
+    let dir = temp_dir();
+    let root = dir.path().join("work");
+    let proj = root.join("proj");
+    fs::create_dir_all(proj.join("src")).unwrap();
+    fs::create_dir_all(proj.join("target").join("debug")).unwrap();
+    write(&proj.join("Cargo.toml"), b"[package]\n");
+    write(&proj.join("src").join("main.rs"), b"fn main() {}\n");
+    write(
+        &proj.join("target").join("debug").join("big.bin"),
+        &[7u8; 4096],
+    );
+    backdate(&proj.join("Cargo.toml"), 200.0);
+    backdate(&proj.join("src").join("main.rs"), 200.0);
+
+    let config = ScanConfig {
+        roots: vec![root.clone()],
+        threads: 2,
+        ..ScanConfig::default()
+    };
+    let result = scan(&config, None, 0, None);
+    let found = reclaim_folders(&result, 10, 90, 0, None);
+    assert_eq!(found.folders.len(), 1, "{found:?}");
+    let folder = &found.folders[0];
+    assert_eq!(folder.category, CatId::DevBuild);
+    assert!(result.node_path(folder.id).ends_with("target"));
+    let project = folder.project.expect("proj is recognized by Cargo.toml");
+    assert_eq!(&*result.nodes[project as usize].name, "proj");
+    assert!(result.nodes[project as usize].markers & projects::RUST != 0);
+    assert!(folder.stale, "source untouched for 200 days");
+    assert!(
+        result.now - folder.contents_newest < SECONDS_PER_DAY,
+        "build output is fresh"
+    );
+
+    // A 200-day-old project is not idle under a 365-day threshold.
+    assert!(!reclaim_folders(&result, 10, 365, 0, None).folders[0].stale);
+
+    // Both reports show it. The real floor is 64 MB, so substitute the list
+    // found without one.
+    let mut result = result;
+    let mut report = build_report(&mut result, &ReportOptions::default());
+    report.reclaim_folders = found;
+    let text = terminal::render(&report, &result, false, 120);
+    assert!(text.contains("-- RECLAIMABLE FOLDERS"), "{text}");
+    assert!(text.contains("proj (rust)"), "{text}");
+    assert!(text.contains("idle for 90 days or more"), "{text}");
+    assert!(text.contains("target  cargo clean"), "{text}");
+    let page = html::render(&report, &result);
+    assert!(page.contains(r#""hint":"cargo clean""#));
+    assert!(page.contains(r#""project":"proj","#));
+    assert!(page.contains(r#""projectKinds":["rust"]"#));
+    assert!(page.contains(r#""stale":true"#));
+
+    // folders.csv carries the newest mtime per folder.
+    let out_dir = temp_dir();
+    let output = OutputDir::create(out_dir.path()).unwrap();
+    write_folder_csv(&result, &output, 0).unwrap();
+    let csv = fs::read_to_string(output.join("folders.csv")).unwrap();
+    assert!(csv
+        .lines()
+        .next()
+        .unwrap()
+        .ends_with(",newest_modified,full_path"));
+}
+
 #[test]
 fn binary_runs_end_to_end() {
     let fixture = build_fixture();
-    let out_dir = tempfile::tempdir().unwrap();
+    let out_dir = temp_dir();
     let reports = out_dir.path().join("run");
     let exe = env!("CARGO_BIN_EXE_diskanalyzer");
 
+    // Run from inside the fixture so `--exclude ./empty` is relative, and
+    // scan `.` so the root is relative too.
     let output = Command::new(exe)
+        .current_dir(&fixture.root)
         .args([
             "--no-color",
             "--quiet",
             "--threads",
             "2",
             "--csv-min-size",
+            "0",
+            "--folder-min-size",
             "0",
             "--duplicates",
         ])
@@ -303,18 +502,18 @@ fn binary_runs_end_to_end() {
             "1000",
             "--exclude-name",
             "skipme",
+            "--exclude-name",
+            "no-such-name",
+            "--exclude",
+            "./empty",
             "--out",
         ])
         .arg(&reports)
-        .arg(&fixture.root)
+        .arg(".")
         .output()
         .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("DISK ANALYZER"));
     assert!(stdout.contains("Reports written to"));
@@ -322,6 +521,40 @@ fn binary_runs_end_to_end() {
     assert!(reports.join("files.csv").is_file());
     assert!(reports.join("folders.csv").is_file());
     assert!(reports.join("report.html").is_file());
+
+    let json = fs::read_to_string(reports.join("report.json")).unwrap();
+    let doc = Json::parse(&json).unwrap();
+    assert_eq!(doc.get("schemaVersion").and_then(Json::as_u64), Some(1));
+    assert_eq!(
+        doc.get("schema").and_then(Json::as_str),
+        Some("diskanalyzer.report")
+    );
+    let config = doc.get("config").unwrap();
+    let roots: Vec<String> = config
+        .get("roots")
+        .and_then(Json::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(Json::as_str)
+        .map(platform::fold_case)
+        .collect();
+    assert_eq!(
+        roots,
+        vec![platform::fold_case(&fixture.root.display().to_string())]
+    );
+    assert_eq!(config.get("folderMinSize").and_then(Json::as_u64), Some(0));
+    assert!(doc.get("generatedEpoch").and_then(Json::as_f64).unwrap() > 0.0);
+
+    // The relative exclusion took effect, and only the unused name is noted.
+    let folders_csv = fs::read_to_string(reports.join("folders.csv")).unwrap();
+    assert!(folders_csv.contains(&*fixture.root.join("b").display().to_string()));
+    assert!(!folders_csv.contains(&*fixture.root.join("empty").display().to_string()));
+    assert!(stdout.contains("Skipped  2 paths (user-excluded, user-excluded name)"));
+    assert!(
+        stderr.contains("--exclude-name no-such-name matched no folder"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("--exclude ./empty"), "{stderr}");
 
     let missing = Command::new(exe)
         .arg(fixture.root.join("does-not-exist"))
@@ -336,4 +569,112 @@ fn binary_runs_end_to_end() {
         .unwrap();
     assert_eq!(verify.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&verify.stdout).contains("Read-only guarantee"));
+}
+
+#[test]
+fn compare_reports_what_changed_since_an_earlier_run() {
+    let fixture = build_fixture();
+    let out = temp_dir();
+    let exe = env!("CARGO_BIN_EXE_diskanalyzer");
+    let run = |args: &[&std::ffi::OsStr]| {
+        Command::new(exe)
+            .args(["--no-color", "--quiet", "--threads", "2"])
+            .args(["--folder-min-size", "0", "--exclude-name", "skipme"])
+            .args(args)
+            .arg(&fixture.root)
+            .output()
+            .unwrap()
+    };
+    let (a, b, c) = (
+        out.path().join("A"),
+        out.path().join("B"),
+        out.path().join("C"),
+    );
+    let sep = std::path::MAIN_SEPARATOR;
+    // Only the CHANGED SINCE section counts: LARGEST FOLDERS lists b and a too.
+    let lists_path_ending = |stdout: &str, tail: &str| {
+        stdout
+            .split("\n-- ")
+            .filter(|section| section.starts_with("CHANGED SINCE"))
+            .flat_map(str::lines)
+            .any(|line| line.trim_end().ends_with(&format!("root{sep}{tail}")))
+    };
+
+    let first = run(&["--out".as_ref(), a.as_os_str()]);
+    assert_eq!(first.status.code(), Some(0));
+
+    // 50 KB more in b/: visible because the baseline listed every folder.
+    write(&fixture.root.join("b").join("new.bin"), &[1u8; 50_000]);
+    let second = run(&[
+        "--compare".as_ref(),
+        a.as_os_str(),
+        "--out".as_ref(),
+        b.as_os_str(),
+    ]);
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(stdout.contains("-- CHANGED SINCE"), "{stdout}");
+    assert!(lists_path_ending(&stdout, "b"), "{stdout}");
+    assert!(!stdout.contains("no report.json"), "{stdout}");
+    let changes = fs::read_to_string(b.join("changes.csv")).unwrap();
+    assert!(changes
+        .starts_with("\u{feff}delta_bytes,delta,before_bytes,after_bytes,status,full_path\r\n"));
+    let b_path = fixture.root.join("b").display().to_string();
+    assert!(
+        changes.contains(&format!("50000,+48.8 KB,20005,70005,grew,{b_path}\r\n")),
+        "{changes}"
+    );
+    let json = Json::parse(&fs::read_to_string(b.join("report.json")).unwrap()).unwrap();
+    let grew = json
+        .get("compare")
+        .and_then(|c| c.get("grew"))
+        .and_then(Json::as_array)
+        .unwrap();
+    assert_eq!(grew.len(), 1, "the chain up to the root collapses into b");
+
+    // Writing the new reports over the baseline is refused before scanning.
+    let clash = run(&[
+        "--compare".as_ref(),
+        a.as_os_str(),
+        "--out".as_ref(),
+        a.as_os_str(),
+    ]);
+    assert_eq!(clash.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&clash.stderr).contains("same directory"));
+
+    // A baseline that does not exist fails fast and creates nothing.
+    let nowhere = out.path().join("nowhere");
+    let d = out.path().join("D");
+    let missing = run(&[
+        "--compare".as_ref(),
+        nowhere.as_os_str(),
+        "--out".as_ref(),
+        d.as_os_str(),
+    ]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(!d.exists());
+
+    // Without report.json the floor is assumed to be the 1 MB default: the
+    // 50 KB is no longer listed, a 1.2 MB change is, and the gap is noted.
+    fs::remove_file(a.join("report.json")).unwrap();
+    write(
+        &fixture.root.join("a").join("big.bin"),
+        &vec![2u8; 1_200_000],
+    );
+    let third = run(&[
+        "--compare".as_ref(),
+        a.as_os_str(),
+        "--out".as_ref(),
+        c.as_os_str(),
+    ]);
+    let stdout = String::from_utf8_lossy(&third.stdout);
+    assert_eq!(third.status.code(), Some(0));
+    assert!(stdout.contains("baseline has no report.json"), "{stdout}");
+    assert!(lists_path_ending(&stdout, "a"), "{stdout}");
+    assert!(!lists_path_ending(&stdout, "b"), "{stdout}");
 }

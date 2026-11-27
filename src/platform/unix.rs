@@ -1,11 +1,11 @@
 //! macOS and Linux.
 
 use std::ffi::CString;
-use std::fs::Metadata;
+use std::fs::{DirEntry, Metadata};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 pub const PATH_SEP: char = '/';
@@ -110,7 +110,28 @@ pub fn is_volume_root(display: &str) -> bool {
 }
 
 pub fn to_scan_path(root: &Path) -> PathBuf {
-    std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf())
+    let absolute = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    normalize_lexically(&absolute)
+}
+
+/// Drop `.` and resolve `..` by text alone. POSIX `absolute` keeps `..`
+/// because resolving it properly means following symlinks; but roots and
+/// `--exclude` paths are compared as strings, so both need one spelling.
+/// (Windows' `absolute` already does this.)
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() && !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 pub fn to_display_path(path: &Path) -> String {
@@ -119,6 +140,19 @@ pub fn to_display_path(path: &Path) -> String {
 
 pub fn is_link(md: &Metadata) -> bool {
     md.file_type().is_symlink()
+}
+
+/// A "dataless" file: its content is held by iCloud or another file provider,
+/// so reading it would download it.
+#[cfg(target_os = "macos")]
+pub fn is_cloud_only(md: &Metadata) -> bool {
+    const SF_DATALESS: u32 = 0x4000_0000;
+    std::os::macos::fs::MetadataExt::st_flags(md) & SF_DATALESS != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_cloud_only(_md: &Metadata) -> bool {
+    false
 }
 
 /// Real allocation from the block count; sparse and compressed files are
@@ -131,12 +165,21 @@ pub fn device_of(md: &Metadata) -> u64 {
     md.dev()
 }
 
-pub fn inode_of(md: &Metadata) -> u64 {
-    md.ino()
+/// `(device, inode)` of a file with more than one hard link, so the scan can
+/// count it once; `None` for a file with a single link. The lstat behind
+/// `md` already carries both, so the entry itself is not needed here.
+pub fn hardlink_key(_entry: &DirEntry, md: &Metadata) -> Option<(u64, u128)> {
+    hardlink_key_in(md)
 }
 
-pub fn link_count(md: &Metadata) -> u64 {
-    md.nlink()
+/// [`hardlink_key`] for a display path instead of a directory entry: an
+/// lstat, so a link is never followed.
+pub fn hardlink_key_of(display: &str) -> Option<(u64, u128)> {
+    hardlink_key_in(&Path::new(display).symlink_metadata().ok()?)
+}
+
+fn hardlink_key_in(md: &Metadata) -> Option<(u64, u128)> {
+    (md.nlink() > 1).then(|| (md.dev(), u128::from(md.ino())))
 }
 
 /// Devices the walk may cross into besides each root's own. On macOS the
@@ -253,4 +296,19 @@ pub fn local_datetime(epoch: f64) -> Option<(i32, u32, u32, u32, u32, u32)> {
         tm.tm_min as u32,
         tm.tm_sec as u32,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_paths_are_absolute_and_lexically_normal() {
+        assert_eq!(to_scan_path(Path::new("/")), Path::new("/"));
+        assert_eq!(to_scan_path(Path::new("/a/./b/../c/")), Path::new("/a/c"));
+        assert_eq!(to_scan_path(Path::new("/../..")), Path::new("/"));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(to_scan_path(Path::new("x/../y")), cwd.join("y"));
+        assert_eq!(normalize_lexically(Path::new("../a")), Path::new("../a"));
+    }
 }

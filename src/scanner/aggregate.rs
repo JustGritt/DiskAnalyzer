@@ -24,15 +24,8 @@ pub fn into_nodes(arena: Vec<Option<DirNode>>) -> Vec<DirNode> {
         .into_iter()
         .map(|slot| {
             slot.unwrap_or(DirNode {
-                name: "".into(),
                 parent: NO_PARENT,
-                depth: 0,
-                category: None,
-                own_size: 0,
-                own_files: 0,
-                total_size: 0,
-                total_files: 0,
-                total_dirs: 0,
+                ..Default::default()
             })
         })
         .collect()
@@ -58,6 +51,8 @@ pub fn run(events: Receiver<Event>, mut sink: Option<&mut dyn FileSink>) -> Aggr
                 category,
                 own_size,
                 own_files,
+                own_newest,
+                markers,
             } => {
                 let index = id as usize;
                 if agg.arena.len() <= index {
@@ -70,9 +65,9 @@ pub fn run(events: Receiver<Event>, mut sink: Option<&mut dyn FileSink>) -> Aggr
                     category,
                     own_size,
                     own_files,
-                    total_size: 0,
-                    total_files: 0,
-                    total_dirs: 0,
+                    own_newest,
+                    markers,
+                    ..Default::default()
                 });
                 agg.total_files += own_files as u64;
                 agg.total_size += own_size;

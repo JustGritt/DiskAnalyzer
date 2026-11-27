@@ -11,6 +11,7 @@ use std::io::{self, BufWriter, Write};
 
 use super::sink::OutputDir;
 use crate::categories::CatId;
+use crate::compare::{change_record, Comparison};
 use crate::platform;
 use crate::scanner::{worker_split_ext, FileSink, ScanResult};
 use crate::util::human_size;
@@ -27,7 +28,7 @@ const FILE_COLUMNS: [&str; 9] = [
     "full_path",
 ];
 
-const FOLDER_COLUMNS: [&str; 9] = [
+const FOLDER_COLUMNS: [&str; 10] = [
     "total_bytes",
     "total_size",
     "files_here_bytes",
@@ -36,6 +37,16 @@ const FOLDER_COLUMNS: [&str; 9] = [
     "subfolders",
     "depth",
     "category",
+    "newest_modified",
+    "full_path",
+];
+
+const CHANGE_COLUMNS: [&str; 6] = [
+    "delta_bytes",
+    "delta",
+    "before_bytes",
+    "after_bytes",
+    "status",
     "full_path",
 ];
 
@@ -184,12 +195,112 @@ pub fn write_folder_csv(result: &ScanResult, out: &OutputDir, min_size: u64) -> 
             node.total_dirs.to_string(),
             node.depth.to_string(),
             node.category.unwrap_or(CatId::Other).label().to_string(),
+            if node.newest > 0.0 {
+                timestamp(node.newest)
+            } else {
+                String::new()
+            },
             paths[id as usize].clone(),
         ])?;
         written += 1;
     }
     csv.finish()?;
     Ok(written)
+}
+
+/// Every folder that changed since the `--compare` baseline by at least the
+/// comparison floor, not collapsed, largest change first.
+pub fn write_changes_csv(comparison: &Comparison, out: &OutputDir) -> io::Result<u64> {
+    let mut csv = CsvWriter::new(out.create_file("changes.csv")?)?;
+    csv.write_record(CHANGE_COLUMNS)?;
+    for change in &comparison.all {
+        csv.write_record(change_record(change))?;
+    }
+    csv.finish()?;
+    Ok(comparison.all.len() as u64)
+}
+
+/// Reads CSV text back: what `CsvWriter` produces, and what a spreadsheet
+/// saves. Handles a UTF-8 BOM, CRLF or LF line ends, quoted fields with `""`
+/// escapes, and quoted fields spanning lines (Unix paths may hold newlines).
+pub struct CsvReader<'a> {
+    text: &'a str,
+    pos: usize,
+}
+
+impl<'a> CsvReader<'a> {
+    pub fn new(text: &'a str) -> CsvReader<'a> {
+        CsvReader {
+            text: text.strip_prefix('\u{feff}').unwrap_or(text),
+            pos: 0,
+        }
+    }
+
+    /// One record, or an error for a quote that never closes. Delimiters
+    /// are ASCII, so every slice boundary is a valid UTF-8 boundary.
+    fn record(&mut self) -> Result<Vec<String>, String> {
+        let bytes = self.text.as_bytes();
+        let mut fields = Vec::new();
+        loop {
+            let mut field = String::new();
+            if bytes.get(self.pos) == Some(&b'"') {
+                self.pos += 1;
+                let mut run = self.pos;
+                loop {
+                    match bytes.get(self.pos) {
+                        None => return Err("a quoted field never closes".to_string()),
+                        Some(b'"') if bytes.get(self.pos + 1) == Some(&b'"') => {
+                            field.push_str(&self.text[run..=self.pos]);
+                            self.pos += 2;
+                            run = self.pos;
+                        }
+                        Some(b'"') => {
+                            field.push_str(&self.text[run..self.pos]);
+                            self.pos += 1;
+                            break;
+                        }
+                        Some(_) => self.pos += 1,
+                    }
+                }
+            }
+            // Unquoted text, or anything trailing a closing quote.
+            let start = self.pos;
+            while let Some(&b) = bytes.get(self.pos) {
+                if matches!(b, b',' | b'\n' | b'\r') {
+                    break;
+                }
+                self.pos += 1;
+            }
+            field.push_str(&self.text[start..self.pos]);
+            fields.push(field);
+            match bytes.get(self.pos) {
+                Some(b',') => self.pos += 1,
+                Some(b'\r') => {
+                    self.pos += 1;
+                    if bytes.get(self.pos) == Some(&b'\n') {
+                        self.pos += 1;
+                    }
+                    return Ok(fields);
+                }
+                Some(b'\n') => {
+                    self.pos += 1;
+                    return Ok(fields);
+                }
+                _ => return Ok(fields),
+            }
+        }
+    }
+}
+
+impl Iterator for CsvReader<'_> {
+    type Item = Result<Vec<String>, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.text.len() {
+            return None;
+        }
+        Some(self.record())
+    }
 }
 
 /// Paths the scan could not read, so the totals can be read honestly.
@@ -221,6 +332,45 @@ mod tests {
             text,
             "\u{feff}plain,\"with,comma\",\"with \"\"quote\"\"\",\"line\nbreak\",\r\n"
         );
+    }
+
+    fn read_all(text: &str) -> Vec<Vec<String>> {
+        CsvReader::new(text).collect::<Result<_, _>>().unwrap()
+    }
+
+    #[test]
+    fn reader_handles_bom_line_ends_quotes_and_newlines() {
+        let text =
+            "\u{feff}a,b,c\r\n1,\"x, y\",\"say \"\"hi\"\"\"\r\n2,\"line\nbreak\",\n3,plain,last\n";
+        assert_eq!(
+            read_all(text),
+            vec![
+                vec!["a", "b", "c"],
+                vec!["1", "x, y", "say \"hi\""],
+                vec!["2", "line\nbreak", ""],
+                vec!["3", "plain", "last"],
+            ]
+        );
+        // No final line end, and a lone CR as a line end.
+        assert_eq!(read_all("a,b\rc,"), vec![vec!["a", "b"], vec!["c", ""]]);
+        assert!(CsvReader::new("a,\"open").next().unwrap().is_err());
+    }
+
+    #[test]
+    fn reader_reads_back_what_the_writer_wrote() {
+        let rows = [
+            vec!["plain", "with,comma", "with \"quote\"", "line\r\nbreak", ""],
+            vec!["é", "", "", "", "end"],
+        ];
+        let mut buf = Vec::new();
+        {
+            let mut csv = CsvWriter::new(&mut buf).unwrap();
+            for row in &rows {
+                csv.write_record(row).unwrap();
+            }
+            csv.finish().unwrap();
+        }
+        assert_eq!(read_all(&String::from_utf8(buf).unwrap()), rows);
     }
 
     #[test]

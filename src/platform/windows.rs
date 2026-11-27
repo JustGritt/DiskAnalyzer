@@ -2,15 +2,23 @@
 //! node_modules trees are not capped at MAX_PATH; reparse points (junctions,
 //! symlinks, mount points) are recorded and never followed.
 
-use std::fs::Metadata;
+use std::fs::{DirEntry, Metadata};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use windows_sys::Win32::Foundation::{BOOL, FILETIME, SYSTEMTIME};
-use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, BOOL, FILETIME, HANDLE, INVALID_HANDLE_VALUE, SYSTEMTIME,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FileIdInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_OFFLINE,
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
 use windows_sys::Win32::System::Console::{
     GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleCtrlHandler,
     SetConsoleMode, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
@@ -110,7 +118,26 @@ pub fn is_link(md: &Metadata) -> bool {
     md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
+/// A placeholder whose content is held by a sync client (OneDrive or Dropbox
+/// "online-only"), so reading it would download it. The attributes come with
+/// the directory listing: nothing is opened to ask.
+pub fn is_cloud_only(md: &Metadata) -> bool {
+    has_cloud_only_attribute(md.file_attributes())
+}
+
+fn has_cloud_only_attribute(attributes: u32) -> bool {
+    const CLOUD_ONLY: u32 = FILE_ATTRIBUTE_OFFLINE
+        | FILE_ATTRIBUTE_RECALL_ON_OPEN
+        | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+    attributes & CLOUD_ONLY != 0
+}
+
+/// The logical size rounded up to whole clusters, except for a cloud-only
+/// file, which holds none.
 pub fn allocated_size(md: &Metadata, cluster: u64) -> u64 {
+    if is_cloud_only(md) {
+        return 0;
+    }
     round_to_cluster(md.len(), cluster)
 }
 
@@ -118,12 +145,83 @@ pub fn device_of(_md: &Metadata) -> u64 {
     0
 }
 
-pub fn inode_of(_md: &Metadata) -> u64 {
-    0
+/// `(volume serial, file ID)` of a file with more than one hard link, so the
+/// scan can count it once; `None` for a file with a single link, or one whose
+/// attributes cannot be read (it is then counted, as without the option).
+///
+/// A directory listing's `Metadata` carries neither the link count nor the
+/// file ID on Windows, so the file is opened, read-only in the narrowest way
+/// the API allows: FILE_READ_ATTRIBUTES access and no data access (no
+/// antivirus scan on open, no last-access update), every share mode so no
+/// other program is blocked, OPEN_EXISTING so nothing can be created, and
+/// FILE_FLAG_OPEN_REPARSE_POINT so nothing is followed.
+pub fn hardlink_key(entry: &DirEntry, _md: &Metadata) -> Option<(u64, u128)> {
+    hardlink_key_at(&entry.path())
 }
 
-pub fn link_count(_md: &Metadata) -> u64 {
-    1
+/// [`hardlink_key`] for a display path instead of a directory entry.
+pub fn hardlink_key_of(display: &str) -> Option<(u64, u128)> {
+    // CreateFileW caps a path at MAX_PATH unless it carries the prefix.
+    hardlink_key_at(&to_scan_path(Path::new(display)))
+}
+
+fn hardlink_key_at(path: &Path) -> Option<(u64, u128)> {
+    let handle = AttributeHandle::open(path)?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 || info.nNumberOfLinks <= 1 {
+        return None;
+    }
+    // Only NTFS guarantees the 64-bit index above is unique; ReFS (Dev
+    // Drives) needs the 128-bit ID. Asked for linked files only.
+    let mut id: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let has_id = unsafe {
+        GetFileInformationByHandleEx(
+            handle.0,
+            FileIdInfo,
+            (&mut id as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    } != 0;
+    Some(if has_id {
+        (
+            id.VolumeSerialNumber,
+            u128::from_le_bytes(id.FileId.Identifier),
+        )
+    } else {
+        (
+            u64::from(info.dwVolumeSerialNumber),
+            (u128::from(info.nFileIndexHigh) << 32) | u128::from(info.nFileIndexLow),
+        )
+    })
+}
+
+/// A handle opened for reading attributes only, closed on drop.
+struct AttributeHandle(HANDLE);
+
+impl AttributeHandle {
+    fn open(path: &Path) -> Option<Self> {
+        let wide_path = wide(path);
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        (handle != INVALID_HANDLE_VALUE).then_some(Self(handle))
+    }
+}
+
+impl Drop for AttributeHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
 }
 
 pub fn extra_allowed_devices() -> Vec<u64> {
@@ -282,6 +380,18 @@ mod tests {
         // Two roots on one drive share a gauge, labelled by the drive.
         assert_eq!(key_a, key_b);
         assert_eq!(label, r"C:\");
+    }
+
+    #[test]
+    fn cloud_only_is_any_of_the_three_recall_attributes() {
+        // Offline, recall on open, recall on data access (here with archive).
+        assert!(has_cloud_only_attribute(0x1000));
+        assert!(has_cloud_only_attribute(0x0004_0000));
+        assert!(has_cloud_only_attribute(0x0040_0000 | 0x20));
+        // Archive, reparse point, and pinned ("always keep on this device").
+        assert!(!has_cloud_only_attribute(0x20 | 0x400 | 0x0008_0000));
+        // Unpinned alone: may be freed later, but the content is here now.
+        assert!(!has_cloud_only_attribute(0x0010_0000));
     }
 
     #[test]

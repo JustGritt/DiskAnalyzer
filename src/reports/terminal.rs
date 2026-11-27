@@ -9,10 +9,16 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 
 use crate::categories::Confidence;
-use crate::insights::Report;
+use crate::compare::{Change, ChangeStatus};
+use crate::exclusions;
+use crate::insights::{Report, RECLAIM_MIN_SIZE};
 use crate::platform;
+use crate::projects;
 use crate::scanner::ScanResult;
-use crate::util::{human_age, human_count, human_duration, human_size, truncate_middle};
+use crate::util::{
+    human_age, human_count, human_days, human_delta, human_duration, human_size, truncate_middle,
+    truncate_start,
+};
 
 /// ANSI colors, or transparent no-ops when the terminal cannot show them.
 pub struct Palette {
@@ -124,9 +130,11 @@ impl TerminalReport<'_> {
         self.render_header();
         self.render_volumes();
         self.render_scan_summary();
+        self.render_comparison();
         self.render_roots();
         self.render_top_folders();
         self.render_categories();
+        self.render_reclaim_folders();
         self.render_top_files();
         self.render_old_files();
         self.render_extensions();
@@ -185,15 +193,26 @@ impl TerminalReport<'_> {
 
     fn render_scan_summary(&mut self) {
         let result = self.result;
-        let used_total: u64 = result.volumes.iter().map(|(_, (_t, used, _f))| *used).sum();
-        let scanned_share = result.total_size as f64 / used_total.max(1) as f64;
+        // Coverage only means something when a whole volume was asked for;
+        // a folder scan is a sliver of the volume by design.
+        let scans_volume = result
+            .root_ids
+            .iter()
+            .any(|&id| platform::is_volume_root(&result.nodes[id as usize].name));
+        let coverage = if scans_volume {
+            let used_total: u64 = result.volumes.iter().map(|(_, (_t, used, _f))| *used).sum();
+            let scanned_share = result.total_size as f64 / used_total.max(1) as f64;
+            format!("  ({:.0}% of used space)", scanned_share * 100.0)
+        } else {
+            String::new()
+        };
         self.blank();
         let text = format!(
-            " Scanned  {} files in {} folders  =  {}  ({:.0}% of used space)",
+            " Scanned  {} files in {} folders  =  {}{}",
             human_count(result.total_files),
             human_count(result.total_dirs),
             self.c.paint(&human_size(result.total_size), &["bold"]),
-            scanned_share * 100.0
+            coverage
         );
         self.line(&text);
         self.line(&format!(" Time     {}", human_duration(result.elapsed)));
@@ -202,11 +221,21 @@ impl TerminalReport<'_> {
             let mut reasons: Vec<&str> = result.skipped.iter().map(|(_, reason)| *reason).collect();
             reasons.sort_unstable();
             reasons.dedup();
+            // Only the OS tables are lifted by --include-os; suggesting it for
+            // the user's own exclusions would be wrong.
+            let hint = if reasons
+                .iter()
+                .any(|reason| exclusions::is_os_reason(reason))
+            {
+                self.c.paint("  --include-os to scan them", &["dim"])
+            } else {
+                String::new()
+            };
             let text = format!(
                 " Skipped  {} paths ({}){}",
                 result.skipped.len(),
                 reasons.join(", "),
-                self.c.paint("  --include-os to scan them", &["dim"])
+                hint
             );
             self.line(&text);
         }
@@ -214,6 +243,13 @@ impl TerminalReport<'_> {
             self.line(&format!(
                 " Links    {} junctions/symlinks not followed, so nothing is counted twice",
                 result.links.len()
+            ));
+        }
+        if result.cloud_only.0 > 0 {
+            self.line(&format!(
+                " Cloud    {} cloud-only files ({}) not stored on this disk; --duplicates does not read them",
+                human_count(result.cloud_only.0),
+                human_size(result.cloud_only.1)
             ));
         }
         if !result.errors.is_empty() {
@@ -227,6 +263,93 @@ impl TerminalReport<'_> {
             );
             self.line(&text);
         }
+    }
+
+    fn render_comparison(&mut self) {
+        let Some(comparison) = &self.report.comparison else {
+            return;
+        };
+        self.heading(&format!("CHANGED SINCE {}", comparison.base_label));
+        for warning in &comparison.warnings {
+            self.note(warning);
+        }
+        let mut totals = format!(
+            " Scanned  {} -> {}  ({})",
+            human_size(comparison.before_total),
+            human_size(comparison.after_total),
+            human_delta(comparison.after_total as i64 - comparison.before_total as i64)
+        );
+        let free =
+            |before: u64, after: u64| format!("{} -> {}", human_size(before), human_size(after));
+        match comparison.volumes.as_slice() {
+            [] => self.line(&totals),
+            [(_, _, _, free_before, free_after)] => {
+                let _ = write!(totals, "      Free  {}", free(*free_before, *free_after));
+                self.line(&totals);
+            }
+            volumes => {
+                self.line(&totals);
+                for (label, _, _, free_before, free_after) in volumes {
+                    self.line(&format!(
+                        " Free     {label}  {}",
+                        free(*free_before, *free_after)
+                    ));
+                }
+            }
+        }
+
+        let mut shrank: Vec<&Change> = comparison
+            .shrank
+            .iter()
+            .chain(&comparison.removed)
+            .collect();
+        shrank.sort_by(|a, b| a.delta.cmp(&b.delta).then_with(|| a.path.cmp(&b.path)));
+        shrank.truncate(self.report.options.top_n);
+        if comparison.grew.is_empty() && shrank.is_empty() {
+            self.note(&format!(
+                "no folder changed by {} or more",
+                human_size(comparison.min_change)
+            ));
+            return;
+        }
+        // delta, before, arrow, after: 3 + 11 + 2 + 10 + 4 + 10 + 2. A signed
+        // "+1,011.6 MB" is 11 wide.
+        let path_width = self.width.saturating_sub(42).max(30);
+        if !comparison.grew.is_empty() {
+            self.line(" Grew");
+            for change in &comparison.grew {
+                self.change_line(change, path_width);
+            }
+        }
+        if !shrank.is_empty() {
+            self.line(" Shrank");
+            for change in shrank {
+                self.change_line(change, path_width);
+            }
+        }
+        self.note(&format!(
+            "folders collapsed to where the change happened; changes under {} not listed",
+            human_size(comparison.min_change)
+        ));
+    }
+
+    fn change_line(&mut self, change: &Change, path_width: usize) {
+        let style = if change.delta > 0 { "yellow" } else { "green" };
+        let delta = self
+            .c
+            .paint(&format!("{:>11}", human_delta(change.delta)), &[style]);
+        let before = change.before.map_or_else(|| "new".to_string(), human_size);
+        let after = match (change.after, change.status) {
+            (Some(_), ChangeStatus::NowUnreadable) => "unreadable".to_string(),
+            (Some(after), _) => human_size(after),
+            (None, ChangeStatus::NowExcluded) => "excluded".to_string(),
+            (None, _) => "removed".to_string(),
+        };
+        let text = format!(
+            "   {delta}  {before:>10} -> {after:<10}  {}",
+            truncate_start(&change.path, path_width)
+        );
+        self.line(&text);
     }
 
     fn render_roots(&mut self) {
@@ -353,6 +476,128 @@ impl TerminalReport<'_> {
         self.note("DiskAnalyzer never deletes. These are places to look, not instructions.");
     }
 
+    fn render_reclaim_folders(&mut self) {
+        let found = &self.report.reclaim_folders;
+        if found.folders.is_empty() {
+            return;
+        }
+        let result = self.result;
+        self.heading("RECLAIMABLE FOLDERS");
+        self.note("top-most regenerable or review folders. idle = time since the project around");
+        self.note("the folder last changed, not counting the folder itself; with no project, its own files");
+        self.blank();
+
+        let key_width = found
+            .folders
+            .iter()
+            .map(|folder| folder.category.key().len())
+            .max()
+            .unwrap_or(0);
+        let project_names: Vec<String> = found
+            .folders
+            .iter()
+            .map(|folder| match folder.project {
+                Some(id) => {
+                    let node = &result.nodes[id as usize];
+                    let name = match projects::primary_kind(node.markers) {
+                        Some(kind) => format!("{} ({kind})", node.name),
+                        None => node.name.to_string(),
+                    };
+                    truncate_middle(&name, 30)
+                }
+                None => "-".to_string(),
+            })
+            .collect();
+        let project_width = project_names
+            .iter()
+            .map(|name| name.chars().count())
+            .max()
+            .unwrap_or(1);
+        let idle_texts: Vec<String> = found
+            .folders
+            .iter()
+            .map(|folder| format!("idle {}", human_age(folder.activity, result.now)))
+            .collect();
+        let idle_width = idle_texts.iter().map(String::len).max().unwrap_or(0);
+        let path_width = self
+            .width
+            .saturating_sub(13 + key_width + 2 + idle_width + 2 + project_width + 2)
+            .max(30);
+        for ((folder, project), idle) in found.folders.iter().zip(&project_names).zip(&idle_texts) {
+            // Pad before coloring, as elsewhere: escape codes count toward widths.
+            let category = self.c.paint(
+                &format!("{:<key_width$}", folder.category.key()),
+                &[confidence_style(folder.category.confidence())],
+            );
+            let idle = format!("{idle:<idle_width$}");
+            let idle = if folder.stale {
+                self.c.paint(&idle, &["yellow"])
+            } else {
+                idle
+            };
+            // The end of the path names the project and the folder; keep it.
+            let text = format!(
+                " {:>11}  {}  {}  {:<project_width$}  {}",
+                human_size(folder.size),
+                category,
+                idle,
+                project,
+                truncate_start(&result.node_path(folder.id), path_width)
+            );
+            self.line(&text);
+        }
+
+        self.blank();
+        let mut summary = format!(
+            "{} folder{} over {}, {} in all",
+            human_count(found.count as u64),
+            if found.count == 1 { "" } else { "s" },
+            human_size(RECLAIM_MIN_SIZE),
+            human_size(found.total)
+        );
+        if found.count > found.folders.len() {
+            let _ = write!(summary, " (largest {} shown)", found.folders.len());
+        }
+        if found.stale > 0 {
+            let _ = write!(
+                summary,
+                "; {} idle for {} or more",
+                human_size(found.stale),
+                human_days(self.report.options.stale_days)
+            );
+        }
+        self.note(&summary);
+        self.note(
+            "Single files such as disc images are not folders; see LARGEST FILES and files.csv.",
+        );
+
+        // Once per distinct hint, not per row: a list of twenty `target`
+        // folders needs `cargo clean` said once.
+        let mut hints: Vec<(&str, &str)> = Vec::new();
+        for folder in &found.folders {
+            if let Some(hint) = folder.hint {
+                if !hints.iter().any(|(_, seen)| *seen == hint) {
+                    hints.push((&result.nodes[folder.id as usize].name, hint));
+                }
+            }
+        }
+        if hints.is_empty() {
+            return;
+        }
+        self.blank();
+        self.note(
+            "How each tool clears its own folder. DiskAnalyzer prints these and never runs them:",
+        );
+        let name_width = hints
+            .iter()
+            .map(|(name, _)| name.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (name, hint) in hints {
+            self.line(&format!("     {name:<name_width$}  {hint}"));
+        }
+    }
+
     fn render_top_files(&mut self) {
         self.heading("LARGEST FILES");
         let path_width = self.width.saturating_sub(30).max(40);
@@ -373,11 +618,10 @@ impl TerminalReport<'_> {
             return;
         }
         let config = &self.result.config;
-        let years = (config.old_file_min_days / 365).max(1);
         self.heading(&format!(
-            "BIG AND UNTOUCHED  (over {}, not modified in {}+ year)",
+            "BIG AND UNTOUCHED  (over {}, not modified for {} or more)",
             human_size(config.old_file_min_size),
-            years
+            human_days(config.old_file_min_days)
         ));
         self.note("large files you have not written to in a long time: the best place to start");
         self.blank();
