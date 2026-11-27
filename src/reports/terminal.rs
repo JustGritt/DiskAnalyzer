@@ -570,6 +570,32 @@ impl TerminalReport<'_> {
         self.note(
             "Single files such as disc images are not folders; see LARGEST FILES and files.csv.",
         );
+
+        // Once per distinct hint, not per row: a list of twenty `target`
+        // folders needs `cargo clean` said once.
+        let mut hints: Vec<(&str, &str)> = Vec::new();
+        for folder in &found.folders {
+            if let Some(hint) = folder.hint {
+                if !hints.iter().any(|(_, seen)| *seen == hint) {
+                    hints.push((&result.nodes[folder.id as usize].name, hint));
+                }
+            }
+        }
+        if hints.is_empty() {
+            return;
+        }
+        self.blank();
+        self.note(
+            "How each tool clears its own folder. DiskAnalyzer prints these and never runs them:",
+        );
+        let name_width = hints
+            .iter()
+            .map(|(name, _)| name.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (name, hint) in hints {
+            self.line(&format!("     {name:<name_width$}  {hint}"));
+        }
     }
 
     fn render_top_files(&mut self) {

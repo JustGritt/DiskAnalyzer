@@ -550,6 +550,7 @@ document.getElementById("reclaim").innerHTML =
           (r.projectKinds.length ? ' <span class="kinds">' + esc(r.projectKinds.join(", ")) + '</span>' : "")
         : '<span class="empty">none found</span>' },
     { label:"Folder", cls:"path", sort:r => r.path, cell:r => esc(r.path) },
+    { label:"To reclaim", sort:r => r.hint || "", cell:r => esc(r.hint || "") },
   ];
   const draw = () => {
     const needle = input.value.trim().toLowerCase();
@@ -568,7 +569,9 @@ document.getElementById("reclaim").innerHTML =
     (count > rows.length ? " (largest " + fmtNum(rows.length) + " listed)" : "") +
     (DATA.reclaimFoldersStale ? "; <b>" + fmtSize(DATA.reclaimFoldersStale) + "</b> idle for " +
       fmtDays(DATA.config.staleDays) + " or more" : "") +
-    ". Single files such as disc images are not folders; see Largest files.";
+    ". Single files such as disc images are not folders; see Largest files." +
+    (rows.some(r => r.hint) ? " <b>To reclaim</b> is how the folder's own tool clears it;" +
+      " DiskAnalyzer shows that and never runs it." : "");
 })();
 
 /* folders */

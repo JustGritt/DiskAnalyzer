@@ -220,6 +220,13 @@ the project it belongs to and how long that project has been idle:
   folder's own newest file is used.
 - A folder counts as idle after `--stale-days` (default 90). Idle ages are
   highlighted, and the HTML report can filter to idle projects only.
+- **How to reclaim.** Where the tool that owns a folder has its own cleanup,
+  the report names it: `cargo clean` for a `target` beside a `Cargo.toml`,
+  `npm cache clean --force` for the npm cache, and so on. The terminal lists
+  each one once under the folders; the HTML report and `report.json` carry it
+  per folder as `hint`. A folder with no known command gets none. These are
+  hints for you to run or ignore: DiskAnalyzer prints them and never runs
+  them.
 
 `folders.csv` carries a `newest_modified` column for every folder, and the
 treemap can be colored by last modification instead of by category.

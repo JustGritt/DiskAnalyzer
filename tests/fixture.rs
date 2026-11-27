@@ -456,7 +456,9 @@ fn reclaimable_folders_are_judged_by_their_project() {
     assert!(text.contains("-- RECLAIMABLE FOLDERS"), "{text}");
     assert!(text.contains("proj (rust)"), "{text}");
     assert!(text.contains("idle for 90 days or more"), "{text}");
+    assert!(text.contains("target  cargo clean"), "{text}");
     let page = html::render(&report, &result);
+    assert!(page.contains(r#""hint":"cargo clean""#));
     assert!(page.contains(r#""project":"proj","#));
     assert!(page.contains(r#""projectKinds":["rust"]"#));
     assert!(page.contains(r#""stale":true"#));

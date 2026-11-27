@@ -171,6 +171,7 @@ fn reclaim_folder_rows(report: &Report, result: &ScanResult) -> Vec<Json> {
                 .set("activity", folder.activity)
                 .set("newest", folder.contents_newest)
                 .set("stale", folder.stale)
+                .set("hint", folder.hint)
         })
         .collect()
 }

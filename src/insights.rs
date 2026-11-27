@@ -93,6 +93,9 @@ pub struct ReclaimFolder {
     /// Newest mtime inside the folder itself.
     pub contents_newest: f64,
     pub stale: bool,
+    /// How the tool that owns the folder clears it, when that is known.
+    /// Printed for the reader; never run.
+    pub hint: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -179,6 +182,43 @@ fn home_dir() -> Option<String> {
         .filter_map(std::env::var_os)
         .map(|v| v.to_string_lossy().into_owned())
         .find(|v| !v.is_empty())
+}
+
+/// How the tool that owns a reclaimable folder clears it. `path` is in the
+/// lowercased, slash-normalized form `categories` matches against.
+///
+/// A wrong command is worse than none: every suffix is a folder the
+/// classifier lists on its own, and anything else gets `None`. The markers
+/// are those of the folder's parent rather than of the owning project,
+/// because `cargo clean` empties the `target` beside a `Cargo.toml` wherever
+/// the repository root is, and a global `node_modules` has no `package.json`
+/// to restore it from.
+fn reclaim_hint(path: &str, parent_markers: u16) -> Option<&'static str> {
+    const VENV: &str = "delete the folder and recreate it with the tool that made it";
+    const NUGET: &str = "dotnet nuget locals all --clear";
+    const NPM: &str = "npm cache clean --force";
+    #[rustfmt::skip]
+    const HINTS: &[(&str, u16, &str)] = &[
+        ("/target", projects::RUST, "cargo clean"),
+        ("/build", projects::GRADLE, "./gradlew clean"),
+        ("/node_modules", projects::NODE, "delete the folder; the package manager's install command restores it"),
+        ("/.venv", 0, VENV),
+        ("/venv", 0, VENV),
+        ("/appdata/local/npm-cache", 0, NPM),
+        ("/appdata/roaming/npm-cache", 0, NPM),
+        ("/appdata/local/pnpm", 0, "pnpm store prune"),
+        ("/appdata/local/yarn/cache", 0, "yarn cache clean"),
+        ("/appdata/local/uv/cache", 0, "uv cache clean"),
+        ("/appdata/local/pip/cache", 0, "pip cache purge"),
+        ("/appdata/local/nuget", 0, NUGET),
+        ("/.nuget", 0, NUGET),
+        ("/.conda", 0, "conda clean --all"),
+        ("/library/developer/coresimulator", 0, "xcrun simctl delete unavailable"),
+    ];
+    HINTS
+        .iter()
+        .find(|(suffix, needs, _)| path.ends_with(suffix) && parent_markers & needs == *needs)
+        .map(|&(_, _, hint)| hint)
 }
 
 /// Find the top-most regenerable or review folders and the projects they
@@ -295,6 +335,10 @@ pub fn reclaim_folders(
                 activity,
                 contents_newest: node.newest,
                 stale,
+                hint: reclaim_hint(
+                    &platform::lower_slash(&result.node_path(id)),
+                    nodes.get(node.parent as usize).map_or(0, |p| p.markers),
+                ),
             });
         }
     }
@@ -654,6 +698,7 @@ mod tests {
         assert_eq!(folder.activity, NOW - 200.0 * DAY);
         assert_eq!(folder.contents_newest, NOW - DAY);
         assert!(folder.stale);
+        assert_eq!(folder.hint, Some("cargo clean"));
         assert_eq!(found.count, 1);
         assert_eq!(found.total, 200);
         assert_eq!(found.stale, 200);
@@ -739,6 +784,41 @@ mod tests {
         assert_eq!(limited.total, 200);
 
         assert_eq!(reclaim_folders(&result, 10, 90, 101, None).count, 0);
+    }
+
+    #[test]
+    fn a_hint_is_the_owning_tools_cleanup_or_nothing() {
+        let rust = projects::GIT | projects::RUST;
+        assert_eq!(
+            reclaim_hint("c:/work/app/target", rust),
+            Some("cargo clean")
+        );
+        assert_eq!(
+            reclaim_hint("/home/me/app/android/build", projects::GRADLE),
+            Some("./gradlew clean")
+        );
+        assert_eq!(
+            reclaim_hint("c:/users/me/appdata/local/npm-cache", 0),
+            Some("npm cache clean --force")
+        );
+        assert_eq!(
+            reclaim_hint("c:/users/me/appdata/local/pip/cache", 0),
+            Some("pip cache purge")
+        );
+        assert!(reclaim_hint("/home/me/site/.venv", 0).is_some());
+
+        // The project decides: Maven builds into `target` too, and a global
+        // `node_modules` has no `package.json` beside it.
+        assert_eq!(reclaim_hint("/home/me/svc/target", projects::MAVEN), None);
+        assert!(reclaim_hint("c:/work/site/node_modules", projects::NODE).is_some());
+        assert_eq!(
+            reclaim_hint("c:/users/me/appdata/roaming/npm/node_modules", 0),
+            None
+        );
+
+        // Reclaimable, but no tool of its own to clear it.
+        assert_eq!(reclaim_hint("c:/users/me/appdata/local/temp", 0), None);
+        assert_eq!(reclaim_hint("c:/work/site/dist", projects::NODE), None);
     }
 
     fn fake_result(nodes: Vec<DirNode>) -> ScanResult {
