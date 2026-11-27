@@ -3,6 +3,7 @@
 
 use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -10,7 +11,9 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::categories::{self, CatId, NUM_CATEGORIES};
+use crate::exclusions;
 use crate::platform;
+use crate::projects;
 
 use super::{age_bucket, Shared, AGE_BUCKETS, CANCELLED, TOP_FILES_LIMIT};
 
@@ -72,6 +75,10 @@ pub enum Event {
         category: Option<CatId>,
         own_size: u64,
         own_files: u32,
+        /// Newest mtime among the files counted here; 0 when there are none.
+        own_newest: f64,
+        /// `projects` marker bits of the entries directly inside.
+        markers: u16,
     },
     FileRow {
         path: String,
@@ -150,6 +157,26 @@ pub fn split_ext(name: &str) -> &str {
     }
 }
 
+/// Extra attempts after a call fails with `EINTR`.
+const INTERRUPTED_RETRIES: u32 = 3;
+
+/// Repeat a filesystem call that was interrupted by a signal. macOS has been
+/// seen to report "Interrupted system call" for app-container folders; the
+/// call itself is harmless to repeat, and a real refusal still surfaces.
+fn retry_interrupted<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut retries = 0;
+    loop {
+        match call() {
+            Err(err)
+                if err.kind() == io::ErrorKind::Interrupted && retries < INTERRUPTED_RETRIES =>
+            {
+                retries += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 fn mtime_of(md: &std::fs::Metadata) -> f64 {
     match md.modified() {
         Ok(time) => match time.duration_since(std::time::UNIX_EPOCH) {
@@ -171,8 +198,10 @@ fn process_dir(
     let at_volume_root = platform::is_volume_root(&job.display);
     let mut own_size: u64 = 0;
     let mut own_files: u32 = 0;
+    let mut own_newest: f64 = 0.0;
+    let mut markers: u16 = 0;
 
-    match std::fs::read_dir(&job.path) {
+    match retry_interrupted(|| std::fs::read_dir(&job.path)) {
         Err(err) => {
             let _ = events.send(Event::Error(job.display.clone(), err.to_string()));
         }
@@ -192,7 +221,7 @@ fn process_dir(
                 let name_os = entry.file_name();
                 let name = name_os.to_string_lossy();
                 let mut display_cache: Option<String> = None;
-                let md = match entry.metadata() {
+                let md = match retry_interrupted(|| entry.metadata()) {
                     Ok(md) => md,
                     Err(err) => {
                         let display = display_of(&mut display_cache, &job.display, &name);
@@ -208,6 +237,9 @@ fn process_dir(
                     continue;
                 }
 
+                // Before any exclusion: a skipped `.git` still marks a project.
+                markers |= projects::marker_bits(&name, md.is_dir());
+
                 if md.is_dir() {
                     let display = display_cache
                         .take()
@@ -219,10 +251,7 @@ fn process_dir(
                     if !config.cross_filesystems
                         && !shared.allowed_devices.contains(&platform::device_of(&md))
                     {
-                        let _ = events.send(Event::Skipped(
-                            display,
-                            "different filesystem (--cross-filesystems to descend)",
-                        ));
+                        let _ = events.send(Event::Skipped(display, exclusions::OTHER_FILESYSTEM));
                         continue;
                     }
                     let name_lower = name.to_lowercase();
@@ -291,6 +320,7 @@ fn process_dir(
                 slot.1 += size;
 
                 let mtime = mtime_of(&md);
+                own_newest = own_newest.max(mtime);
                 let slot = &mut state.age_stats[age_bucket(mtime, shared.now)];
                 slot.0 += 1;
                 slot.1 += size;
@@ -372,6 +402,8 @@ fn process_dir(
         category: job.category,
         own_size,
         own_files,
+        own_newest,
+        markers,
     });
 }
 
@@ -394,6 +426,36 @@ mod tests {
         assert_eq!(split_ext(".profile.bak"), ".bak");
         assert_eq!(split_ext("trailing."), ".");
         assert_eq!(split_ext("Movie.MKV"), ".MKV");
+    }
+
+    #[test]
+    fn interrupted_calls_are_retried_a_bounded_number_of_times() {
+        let mut calls = 0;
+        let outcome = retry_interrupted(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(outcome.unwrap(), 3);
+
+        let mut calls = 0;
+        let outcome: io::Result<()> = retry_interrupted(|| {
+            calls += 1;
+            Err(io::Error::from(io::ErrorKind::Interrupted))
+        });
+        assert!(outcome.is_err());
+        assert_eq!(calls, 1 + INTERRUPTED_RETRIES);
+
+        let mut calls = 0;
+        let outcome: io::Result<()> = retry_interrupted(|| {
+            calls += 1;
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert!(outcome.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[test]

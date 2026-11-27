@@ -1,17 +1,22 @@
 //! Command-line entry point: argument parsing and wiring.
 
+use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 
-use crate::insights::build_report;
+use crate::compare::{compare, resolve_baseline_dir, same_dir, Baseline};
+use crate::exclusions;
+use crate::insights::{build_report, ReportOptions};
 use crate::platform;
-use crate::reports::csv::{write_error_csv, write_folder_csv, FileListWriter};
-use crate::reports::html::write_html;
+use crate::reports::csv::{write_changes_csv, write_error_csv, write_folder_csv, FileListWriter};
+use crate::reports::html::write_html_payload;
+use crate::reports::json::write_json;
+use crate::reports::payload::build_payload;
 use crate::reports::sink::OutputDir;
 use crate::reports::terminal;
 use crate::scanner::{scan, FileSink, ScanConfig, ScanProgress};
@@ -74,6 +79,14 @@ pub struct Args {
         help_heading = "Detail"
     )]
     pub old_min_days: u64,
+    /// a project unchanged this long counts as idle in the reclaimable-folders list
+    #[arg(
+        long,
+        default_value_t = 90,
+        value_name = "DAYS",
+        help_heading = "Detail"
+    )]
+    pub stale_days: u64,
     /// look for duplicate files (reads 128KB per candidate)
     #[arg(long, help_heading = "Detail")]
     pub duplicates: bool,
@@ -87,7 +100,7 @@ pub struct Args {
     /// size floor for the CSV file listing; 0 lists every file
     #[arg(long, default_value = "10MB", value_name = "SIZE", value_parser = size_arg, help_heading = "Output")]
     pub csv_min_size: u64,
-    /// size floor for the CSV folder listing; 0 lists every folder
+    /// size floor for the CSV folder listing and --compare; 0 lists every folder
     #[arg(long, default_value = "1MB", value_name = "SIZE", value_parser = size_arg, help_heading = "Output")]
     pub folder_min_size: u64,
     /// skip the HTML report
@@ -96,12 +109,20 @@ pub struct Args {
     /// skip the CSV listings
     #[arg(long, help_heading = "Output")]
     pub no_csv: bool,
+    /// skip report.json, the machine-readable copy of the report
+    #[arg(long, help_heading = "Output")]
+    pub no_json: bool,
     /// disable ANSI color
     #[arg(long, help_heading = "Output")]
     pub no_color: bool,
     /// suppress progress output
     #[arg(long, help_heading = "Output")]
     pub quiet: bool,
+
+    /// report directory of an earlier scan to compare against, or `last` for
+    /// the newest one in ./reports
+    #[arg(long, value_name = "DIR", help_heading = "Compare")]
+    pub compare: Option<String>,
 
     /// worker threads (default: twice the CPU count, at most 16)
     #[arg(long, value_name = "N", help_heading = "Performance")]
@@ -161,6 +182,47 @@ impl ProgressLine {
     }
 }
 
+/// `--exclude` paths and `--exclude-name` names that skipped nothing, so a
+/// typo is reported instead of quietly scanning what the user meant to skip.
+fn unmatched_exclusions<'a>(
+    exclude: &'a [String],
+    exclude_name: &'a [String],
+    skipped: &[(String, &'static str)],
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    let skipped_dirs: HashSet<String> = skipped
+        .iter()
+        .filter(|(_, reason)| *reason == exclusions::USER_EXCLUDED)
+        .map(|(path, _)| exclusions::normalize_key(path))
+        .collect();
+    let skipped_names: HashSet<String> = skipped
+        .iter()
+        .filter(|(_, reason)| *reason == exclusions::USER_EXCLUDED_NAME)
+        .filter_map(|(path, _)| {
+            path.trim_end_matches(['\\', '/'])
+                .rsplit(['\\', '/'])
+                .next()
+        })
+        .map(str::to_lowercase)
+        .collect();
+    let dirs = exclude
+        .iter()
+        .filter(|path| {
+            let key = exclusions::normalize_key(&exclusions::absolute_display(path));
+            !skipped_dirs.contains(&key)
+        })
+        .map(String::as_str)
+        .collect();
+    let names = exclude_name
+        .iter()
+        .filter(|name| {
+            let name = name.trim().to_lowercase();
+            !name.is_empty() && !skipped_names.contains(&name)
+        })
+        .map(String::as_str)
+        .collect();
+    (dirs, names)
+}
+
 fn default_output_dir() -> PathBuf {
     let stamp = match platform::local_datetime(now_epoch()) {
         Some((y, mo, d, h, mi, s)) => format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}"),
@@ -200,6 +262,13 @@ pub fn run_with(args: Args) -> i32 {
             "--cluster-size only applies on Windows; --allocated uses real block counts here."
         );
     }
+    for path in &args.exclude {
+        if !Path::new(path).is_dir() {
+            eprintln!(
+                "Note: --exclude {path} is not an existing folder, so it will not skip anything."
+            );
+        }
+    }
 
     let config = ScanConfig {
         roots: roots.clone(),
@@ -220,8 +289,45 @@ pub fn run_with(args: Args) -> i32 {
 
     let want_files = !args.no_csv;
     let want_html = !args.no_html;
+    let want_json = !args.no_json;
     let out_dir = args.out.clone().unwrap_or_else(default_output_dir);
-    let output = if want_files || want_html {
+
+    // The baseline is read before anything is created, so a bad --compare
+    // fails fast and never leaves an empty report directory behind.
+    let baseline = match &args.compare {
+        None => None,
+        Some(arg) => {
+            let dir = match resolve_baseline_dir(arg, &out_dir) {
+                Ok(dir) => dir,
+                Err(err) => {
+                    eprintln!("Cannot compare: {err}");
+                    return 2;
+                }
+            };
+            if same_dir(&dir, &out_dir) {
+                eprintln!(
+                    "Cannot compare: --compare and --out are the same directory ({}); \
+                     the new reports would overwrite the baseline. Choose another --out.",
+                    dir.display()
+                );
+                return 2;
+            }
+            match Baseline::load(&dir) {
+                Ok(base) => {
+                    if !args.quiet {
+                        eprintln!("Comparing with {} ({})", dir.display(), base.label);
+                    }
+                    Some(base)
+                }
+                Err(err) => {
+                    eprintln!("Cannot compare: {err}");
+                    return 2;
+                }
+            }
+        }
+    };
+
+    let output = if want_files || want_html || want_json {
         match OutputDir::create(&out_dir) {
             Ok(output) => Some(output),
             Err(err) => {
@@ -298,8 +404,30 @@ pub fn run_with(args: Args) -> i32 {
             eprintln!("Warning: files.csv was not fully written: {err}");
         }
     }
+    let (unused_dirs, unused_names) =
+        unmatched_exclusions(&args.exclude, &args.exclude_name, &result.skipped);
+    for path in unused_dirs {
+        if Path::new(path).is_dir() {
+            eprintln!("Note: --exclude {path} matched no folder inside the scanned roots.");
+        }
+    }
+    for name in unused_names {
+        eprintln!("Note: --exclude-name {name} matched no folder in this scan.");
+    }
 
-    let report = build_report(&mut result, args.top, args.files, args.duplicates);
+    let options = ReportOptions {
+        top_n: args.top,
+        file_n: args.files,
+        with_duplicates: args.duplicates,
+        csv_min_size: args.csv_min_size,
+        folder_min_size: args.folder_min_size,
+        stale_days: args.stale_days,
+    };
+    let mut report = build_report(&mut result, &options);
+    report.comparison = baseline
+        .as_ref()
+        .map(|base| compare(&result, base, args.top, args.folder_min_size));
+    drop(baseline);
 
     let color = !args.no_color && terminal::supports_color();
     let text = terminal::render(&report, &result, color, terminal::terminal_width());
@@ -323,11 +451,25 @@ pub fn run_with(args: Args) -> i32 {
                     Err(err) => eprintln!("Warning: unreadable.csv was not written: {err}"),
                 }
             }
+            if let Some(comparison) = &report.comparison {
+                match write_changes_csv(comparison, output) {
+                    Ok(_) => written.push(("changes.csv", output.join("changes.csv"))),
+                    Err(err) => eprintln!("Warning: changes.csv was not written: {err}"),
+                }
+            }
         }
-        if want_html {
-            match write_html(&report, &result, output) {
+        // One payload for both documents, so they cannot disagree.
+        let payload = (want_html || want_json).then(|| build_payload(&report, &result));
+        if let (true, Some(payload)) = (want_html, &payload) {
+            match write_html_payload(payload, output) {
                 Ok(()) => written.push(("report.html", output.join("report.html"))),
                 Err(err) => eprintln!("Warning: report.html was not written: {err}"),
+            }
+        }
+        if let (true, Some(payload)) = (want_json, &payload) {
+            match write_json(payload, output) {
+                Ok(()) => written.push(("report.json", output.join("report.json"))),
+                Err(err) => eprintln!("Warning: report.json was not written: {err}"),
             }
         }
     }
@@ -382,6 +524,8 @@ mod tests {
         assert_eq!(args.dup_min_size, 25 * 1024 * 1024);
         assert_eq!(args.csv_min_size, 10 * 1024 * 1024);
         assert_eq!(args.folder_min_size, 1024 * 1024);
+        assert_eq!(args.stale_days, 90);
+        assert_eq!(args.stale_days, ReportOptions::default().stale_days);
         assert!(!args.duplicates);
         assert!(args.roots.is_empty());
     }
@@ -408,5 +552,25 @@ mod tests {
         assert_eq!(args.old_min_size, 1_610_612_736);
         assert_eq!(args.roots, vec![PathBuf::from("/tmp")]);
         assert!(Args::try_parse_from(["diskanalyzer", "--csv-min-size", "lots"]).is_err());
+    }
+
+    #[test]
+    fn exclusions_that_skipped_nothing_are_reported() {
+        let hit = exclusions::absolute_display("hit");
+        let hit_name = platform::join_display(&exclusions::absolute_display("x"), "Build");
+        let skipped = vec![
+            (hit.clone(), exclusions::USER_EXCLUDED),
+            (hit_name, exclusions::USER_EXCLUDED_NAME),
+            (exclusions::absolute_display("os"), "windows os"),
+        ];
+        let exclude = vec!["./hit".to_string(), "miss".to_string(), "os".to_string()];
+        let names = vec![
+            "build".to_string(),
+            "nothing-here".to_string(),
+            " ".to_string(),
+        ];
+        let (dirs, unused_names) = unmatched_exclusions(&exclude, &names, &skipped);
+        assert_eq!(dirs, vec!["miss", "os"]);
+        assert_eq!(unused_names, vec!["nothing-here"]);
     }
 }

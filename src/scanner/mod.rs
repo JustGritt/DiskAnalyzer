@@ -33,7 +33,7 @@ use std::thread;
 use crossbeam_channel::unbounded;
 
 use crate::categories::{self, CatId, NUM_CATEGORIES};
-use crate::exclusions::ExclusionSet;
+use crate::exclusions::{self, ExclusionSet};
 use crate::platform;
 use crate::util::now_epoch;
 
@@ -121,9 +121,10 @@ pub fn default_thread_count() -> usize {
     (cores * 2).clamp(1, 16)
 }
 
-/// One directory. `own_*` counts files directly inside; `total_*` includes
-/// every descendant and is filled in by the rollup after the walk.
-#[derive(Clone, Debug)]
+/// One directory. `own_*` counts files directly inside; `total_*` and
+/// `newest` include every descendant and are filled in by the rollup after
+/// the walk.
+#[derive(Clone, Debug, Default)]
 pub struct DirNode {
     /// Basename, except for roots which carry their full display path.
     pub name: Box<str>,
@@ -132,9 +133,15 @@ pub struct DirNode {
     pub category: Option<CatId>,
     pub own_size: u64,
     pub own_files: u32,
+    /// Newest file mtime directly inside; 0 when there are no files.
+    pub own_newest: f64,
+    /// `projects` marker bits found directly inside.
+    pub markers: u16,
     pub total_size: u64,
     pub total_files: u64,
     pub total_dirs: u32,
+    /// Newest file mtime anywhere in the subtree; 0 when it holds no files.
+    pub newest: f64,
 }
 
 /// Live counters the CLI's progress line reads while the scan runs.
@@ -288,11 +295,14 @@ pub fn scan(
     result.started_at = started;
     result.now = now;
 
-    let exclusions = ExclusionSet::new(
-        config.include_os,
-        &config.exclude_dirs,
-        &config.exclude_names,
-    );
+    // Roots are made absolute below; exclusions must be too, or a relative
+    // `--exclude` would silently never match anything.
+    let exclude_dirs: Vec<String> = config
+        .exclude_dirs
+        .iter()
+        .map(|path| exclusions::absolute_display(path))
+        .collect();
+    let exclusions = ExclusionSet::new(config.include_os, &exclude_dirs, &config.exclude_names);
     let mut allowed_devices = platform::extra_allowed_devices();
     let mut seen_volumes = HashSet::new();
     let mut root_jobs = Vec::new();
@@ -451,6 +461,7 @@ pub fn roll_up(nodes: &mut [DirNode]) {
         node.total_size = node.own_size;
         node.total_files = node.own_files as u64;
         node.total_dirs = 0;
+        node.newest = node.own_newest;
     }
     for id in (0..nodes.len()).rev() {
         let parent = nodes[id].parent;
@@ -458,15 +469,17 @@ pub fn roll_up(nodes: &mut [DirNode]) {
             continue;
         }
         debug_assert!((parent as usize) < id, "child id must exceed parent id");
-        let (size, files, dirs) = (
+        let (size, files, dirs, newest) = (
             nodes[id].total_size,
             nodes[id].total_files,
             nodes[id].total_dirs,
+            nodes[id].newest,
         );
         let parent = &mut nodes[parent as usize];
         parent.total_size += size;
         parent.total_files += files;
         parent.total_dirs += dirs + 1;
+        parent.newest = parent.newest.max(newest);
     }
 }
 
@@ -489,27 +502,25 @@ mod tests {
         assert_eq!(age_bucket(now + day, now), 0);
     }
 
-    fn node(parent: u32, depth: u16, own_size: u64, own_files: u32) -> DirNode {
+    fn node(parent: u32, depth: u16, own_size: u64, own_files: u32, own_newest: f64) -> DirNode {
         DirNode {
             name: "n".into(),
             parent,
             depth,
-            category: None,
             own_size,
             own_files,
-            total_size: 0,
-            total_files: 0,
-            total_dirs: 0,
+            own_newest,
+            ..Default::default()
         }
     }
 
     #[test]
     fn rollup_sums_children_into_parents() {
         let mut nodes = vec![
-            node(NO_PARENT, 0, 10, 1),
-            node(0, 1, 20, 2),
-            node(0, 1, 30, 3),
-            node(2, 2, 40, 4),
+            node(NO_PARENT, 0, 10, 1, 5.0),
+            node(0, 1, 20, 2, 50.0),
+            node(0, 1, 30, 3, 0.0),
+            node(2, 2, 40, 4, 20.0),
         ];
         roll_up(&mut nodes);
         assert_eq!(nodes[0].total_size, 100);
@@ -518,5 +529,14 @@ mod tests {
         assert_eq!(nodes[2].total_size, 70);
         assert_eq!(nodes[2].total_dirs, 1);
         assert_eq!(nodes[3].total_dirs, 0);
+        assert_eq!(nodes[0].newest, 50.0);
+        assert_eq!(
+            nodes[2].newest, 20.0,
+            "an empty folder takes its child's newest"
+        );
+        assert_eq!(nodes[3].newest, 20.0);
+        // Running it twice gives the same answer.
+        roll_up(&mut nodes);
+        assert_eq!(nodes[0].newest, 50.0);
     }
 }

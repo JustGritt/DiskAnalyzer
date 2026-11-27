@@ -7,13 +7,34 @@
 //! elevated rights are skipped by default. The tables live in `platform`.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use crate::platform;
+
+/// Skip reason for a folder named with `--exclude`.
+pub const USER_EXCLUDED: &str = "user-excluded";
+/// Skip reason for a folder matched by `--exclude-name`.
+pub const USER_EXCLUDED_NAME: &str = "user-excluded name";
+/// Skip reason for a mount point the walk does not cross by default.
+pub const OTHER_FILESYSTEM: &str = "different filesystem (--cross-filesystems to descend)";
 
 /// Comparison key for a directory path: trailing separators dropped and the
 /// case folded according to the platform's filesystem conventions.
 pub fn normalize_key(display_path: &str) -> String {
     platform::fold_case(display_path.trim_end_matches(['\\', '/']))
+}
+
+/// The absolute display form of a path as the user typed it. Roots get the
+/// same treatment in the scanner, so `--exclude src/x` run from `/proj`
+/// matches the `/proj/src/x` the walk actually sees.
+pub fn absolute_display(path: &str) -> String {
+    platform::to_display_path(&platform::to_scan_path(Path::new(path)))
+}
+
+/// Whether a skip reason comes from the default OS tables, which is the only
+/// case where `--include-os` would have scanned the path.
+pub fn is_os_reason(reason: &str) -> bool {
+    platform::os_exclusions().iter().any(|(_, r)| *r == reason)
 }
 
 /// Decides, per directory, whether the scanner descends into it.
@@ -35,7 +56,7 @@ impl ExclusionSet {
             dirs.insert(normalize_key(path), *reason);
         }
         for path in extra_dirs {
-            dirs.insert(normalize_key(path), "user-excluded");
+            dirs.insert(normalize_key(path), USER_EXCLUDED);
         }
         let names = extra_names
             .iter()
@@ -51,7 +72,7 @@ impl ExclusionSet {
             return Some(reason);
         }
         if !self.names.is_empty() && self.names.contains(&name.to_lowercase()) {
-            return Some("user-excluded name");
+            return Some(USER_EXCLUDED_NAME);
         }
         None
     }
@@ -76,7 +97,7 @@ mod tests {
         let set = ExclusionSet::new(true, &["/tmp/skip-me/".to_string()], &[]);
         assert_eq!(
             set.reason_for("/tmp/skip-me", "skip-me"),
-            Some("user-excluded")
+            Some(USER_EXCLUDED)
         );
         assert_eq!(set.reason_for("/tmp/skip-me/child", "child"), None);
         assert_eq!(set.reason_for("/tmp/skip-me-not", "skip-me-not"), None);
@@ -87,9 +108,32 @@ mod tests {
         let set = ExclusionSet::new(true, &[], &[" Node_Modules ".to_string(), "".to_string()]);
         assert_eq!(
             set.reason_for("/x/node_modules", "node_modules"),
-            Some("user-excluded name")
+            Some(USER_EXCLUDED_NAME)
         );
         assert_eq!(set.reason_for("/x/src", "src"), None);
+    }
+
+    #[test]
+    fn relative_exclusions_resolve_against_the_current_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let cwd = platform::to_display_path(&cwd);
+        let expected = platform::join_display(&cwd, "some-dir");
+        assert_eq!(absolute_display("some-dir"), expected);
+        assert_eq!(absolute_display("./some-dir"), expected);
+        assert_eq!(absolute_display("other/../some-dir"), expected);
+
+        let set = ExclusionSet::new(true, &[absolute_display("some-dir")], &[]);
+        assert_eq!(set.reason_for(&expected, "some-dir"), Some(USER_EXCLUDED));
+    }
+
+    #[test]
+    fn only_os_table_reasons_count_as_os() {
+        assert!(!is_os_reason(USER_EXCLUDED));
+        assert!(!is_os_reason(USER_EXCLUDED_NAME));
+        assert!(!is_os_reason(OTHER_FILESYSTEM));
+        if let Some((_, reason)) = platform::os_exclusions().first() {
+            assert!(is_os_reason(reason));
+        }
     }
 
     #[test]
