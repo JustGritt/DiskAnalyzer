@@ -13,7 +13,9 @@ cargo build --release
 ```
 
 A single native executable. No runtime, no dependencies to install.
-Windows, macOS and Linux.
+Windows, macOS and Linux. Each tagged release also attaches a prebuilt binary
+per platform to its
+[GitHub release](https://github.com/JustGritt/DiskAnalyzer/releases).
 
 ---
 
